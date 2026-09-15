@@ -232,6 +232,7 @@ local State = {
     webhookUrl = "",
     notifyEnabled = false,
     notifyEggs = {},
+    glideSpeed = 500,
 }
 
 local function saveState()
@@ -256,6 +257,7 @@ local function loadState()
             if type(decoded.webhookUrl) == "string" then State.webhookUrl = decoded.webhookUrl end
             if type(decoded.notifyEnabled) == "boolean" then State.notifyEnabled = decoded.notifyEnabled end
             if type(decoded.notifyEggs) == "table" then State.notifyEggs = decoded.notifyEggs end
+            if type(decoded.glideSpeed) == "number" then State.glideSpeed = decoded.glideSpeed end
         end
     end
 end
@@ -288,6 +290,12 @@ Main.Parent = ScreenGui
 corner(Main, 14)
 stroke(Main, COLORS.stroke, 1)
 
+local Header = Instance.new("Frame")
+Header.Name = "Header"
+Header.Size = UDim2.new(1, 0, 0, 50)
+Header.BackgroundTransparency = 1
+Header.Parent = Main
+
 do
     local dragging, dragStart, startPos
     local function update(input)
@@ -296,7 +304,7 @@ do
             startPos.Y.Scale, startPos.Y.Offset + delta.Y)
     end
 
-    Main.InputBegan:Connect(function(input)
+    Header.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
@@ -317,12 +325,6 @@ do
         end
     end)
 end
-
-local Header = Instance.new("Frame")
-Header.Name = "Header"
-Header.Size = UDim2.new(1, 0, 0, 50)
-Header.BackgroundTransparency = 1
-Header.Parent = Main
 
 local Title = Instance.new("TextLabel")
 Title.Text = "Ride a Pet"
@@ -385,62 +387,6 @@ local BodyLayout = Instance.new("UIListLayout")
 BodyLayout.Padding = UDim.new(0, 8)
 BodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
 BodyLayout.Parent = Body
-
-local function buildActionRow(labelText, descText, buttonText, order)
-    local Row = Instance.new("Frame")
-    Row.Size = UDim2.new(1, 0, 0, 62)
-    Row.BackgroundColor3 = COLORS.card
-    Row.LayoutOrder = order
-    Row.Parent = Body
-    corner(Row, 10)
-
-    local NameLbl = Instance.new("TextLabel")
-    NameLbl.Text = labelText
-    NameLbl.Font = Enum.Font.GothamBold
-    NameLbl.TextSize = 14
-    NameLbl.TextColor3 = COLORS.text
-    NameLbl.TextXAlignment = Enum.TextXAlignment.Left
-    NameLbl.BackgroundTransparency = 1
-    NameLbl.Position = UDim2.new(0, 12, 0, 8)
-    NameLbl.Size = UDim2.new(1, -110, 0, 18)
-    NameLbl.Parent = Row
-
-    local DescLbl = Instance.new("TextLabel")
-    DescLbl.Text = descText
-    DescLbl.Font = Enum.Font.Gotham
-    DescLbl.TextSize = 12
-    DescLbl.TextColor3 = COLORS.subtext
-    DescLbl.TextXAlignment = Enum.TextXAlignment.Left
-    DescLbl.TextTruncate = Enum.TextTruncate.AtEnd
-    DescLbl.BackgroundTransparency = 1
-    DescLbl.Position = UDim2.new(0, 12, 0, 28)
-    DescLbl.Size = UDim2.new(1, -110, 0, 22)
-    DescLbl.Parent = Row
-
-    local ActionBtn = Instance.new("TextButton")
-    ActionBtn.Text = buttonText
-    ActionBtn.Font = Enum.Font.GothamBold
-    ActionBtn.TextSize = 13
-    ActionBtn.TextColor3 = Color3.new(1, 1, 1)
-    ActionBtn.BackgroundColor3 = COLORS.accent
-    ActionBtn.Position = UDim2.new(1, -92, 0.5, -15)
-    ActionBtn.Size = UDim2.new(0, 80, 0, 30)
-    ActionBtn.AutoButtonColor = false
-    ActionBtn.Parent = Row
-    corner(ActionBtn, 8)
-    ActionBtn.MouseEnter:Connect(function() tween(ActionBtn, { BackgroundColor3 = COLORS.accentHover }) end)
-    ActionBtn.MouseLeave:Connect(function() tween(ActionBtn, { BackgroundColor3 = COLORS.accent }) end)
-
-    return Row, ActionBtn, DescLbl
-end
-
-local selectRow, selectBtn, selectDesc = buildActionRow("Egg Type", "Tap to choose eggs", "Select", 1)
-local teleportRow, teleportBtn, teleportDesc = buildActionRow("Teleport", "Pick at least one egg type", "Go", 2)
-local baseRow, baseBtn, baseDesc = buildActionRow("Base", "Saving location...", "Go", 3)
-local farmRow, farmBtn, farmDesc = buildActionRow("Auto Farm", "Pick an egg type first", "OFF", 4)
-local webhookRow, webhookBtn, webhookDesc = buildActionRow("Webhook", "Not set", "Set", 5)
-local notifyRow, notifyBtn, notifyDesc = buildActionRow("Notify On", "All grabbed eggs", "Select", 6)
-local notifyToggleRow, notifyToggleBtn, notifyToggleDesc = buildActionRow("Notifications", "Set a webhook first", "OFF", 7)
 
 local function prompt(titleText, defaultText, placeholderText, onConfirm)
     local Overlay = Instance.new("Frame")
@@ -513,6 +459,198 @@ local function prompt(titleText, defaultText, placeholderText, onConfirm)
         if enterPressed then finish() end
     end)
 end
+
+local function buildActionRow(labelText, descText, buttonText, order)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, 0, 0, 62)
+    Row.BackgroundColor3 = COLORS.card
+    Row.LayoutOrder = order
+    Row.Parent = Body
+    corner(Row, 10)
+
+    local NameLbl = Instance.new("TextLabel")
+    NameLbl.Text = labelText
+    NameLbl.Font = Enum.Font.GothamBold
+    NameLbl.TextSize = 14
+    NameLbl.TextColor3 = COLORS.text
+    NameLbl.TextXAlignment = Enum.TextXAlignment.Left
+    NameLbl.BackgroundTransparency = 1
+    NameLbl.Position = UDim2.new(0, 12, 0, 8)
+    NameLbl.Size = UDim2.new(1, -110, 0, 18)
+    NameLbl.Parent = Row
+
+    local DescLbl = Instance.new("TextLabel")
+    DescLbl.Text = descText
+    DescLbl.Font = Enum.Font.Gotham
+    DescLbl.TextSize = 12
+    DescLbl.TextColor3 = COLORS.subtext
+    DescLbl.TextXAlignment = Enum.TextXAlignment.Left
+    DescLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    DescLbl.BackgroundTransparency = 1
+    DescLbl.Position = UDim2.new(0, 12, 0, 28)
+    DescLbl.Size = UDim2.new(1, -110, 0, 22)
+    DescLbl.Parent = Row
+
+    local ActionBtn = Instance.new("TextButton")
+    ActionBtn.Text = buttonText
+    ActionBtn.Font = Enum.Font.GothamBold
+    ActionBtn.TextSize = 13
+    ActionBtn.TextColor3 = Color3.new(1, 1, 1)
+    ActionBtn.BackgroundColor3 = COLORS.accent
+    ActionBtn.Position = UDim2.new(1, -92, 0.5, -15)
+    ActionBtn.Size = UDim2.new(0, 80, 0, 30)
+    ActionBtn.AutoButtonColor = false
+    ActionBtn.Parent = Row
+    corner(ActionBtn, 8)
+    ActionBtn.MouseEnter:Connect(function() tween(ActionBtn, { BackgroundColor3 = COLORS.accentHover }) end)
+    ActionBtn.MouseLeave:Connect(function() tween(ActionBtn, { BackgroundColor3 = COLORS.accent }) end)
+
+    return Row, ActionBtn, DescLbl
+end
+
+local function buildSliderRow(labelText, minVal, maxVal, initialVal, order, onChange)
+    local Row = Instance.new("Frame")
+    Row.Size = UDim2.new(1, 0, 0, 70)
+    Row.BackgroundColor3 = COLORS.card
+    Row.LayoutOrder = order
+    Row.Parent = Body
+    corner(Row, 10)
+
+    local NameLbl = Instance.new("TextLabel")
+    NameLbl.Text = labelText
+    NameLbl.Font = Enum.Font.GothamBold
+    NameLbl.TextSize = 14
+    NameLbl.TextColor3 = COLORS.text
+    NameLbl.TextXAlignment = Enum.TextXAlignment.Left
+    NameLbl.BackgroundTransparency = 1
+    NameLbl.Position = UDim2.new(0, 12, 0, 8)
+    NameLbl.Size = UDim2.new(1, -100, 0, 18)
+    NameLbl.Parent = Row
+
+    local ValueLbl = Instance.new("TextButton")
+    ValueLbl.Font = Enum.Font.GothamBold
+    ValueLbl.TextSize = 13
+    ValueLbl.TextColor3 = COLORS.accent
+    ValueLbl.TextXAlignment = Enum.TextXAlignment.Right
+    ValueLbl.BackgroundTransparency = 1
+    ValueLbl.AutoButtonColor = false
+    ValueLbl.Position = UDim2.new(1, -92, 0, 8)
+    ValueLbl.Size = UDim2.new(0, 80, 0, 18)
+    ValueLbl.Text = tostring(initialVal) .. " studs/s"
+    ValueLbl.Parent = Row
+
+    local Track = Instance.new("Frame")
+    Track.BackgroundColor3 = COLORS.bg
+    Track.Position = UDim2.new(0, 12, 0, 38)
+    Track.Size = UDim2.new(1, -24, 0, 8)
+    Track.Active = true
+    Track.Parent = Row
+    corner(Track, 4)
+
+    local Fill = Instance.new("Frame")
+    Fill.BackgroundColor3 = COLORS.accent
+    Fill.Position = UDim2.new(0, 0, 0, 0)
+    Fill.Size = UDim2.new(0, 0, 1, 0)
+    Fill.Parent = Track
+    corner(Fill, 4)
+
+    local Knob = Instance.new("Frame")
+    Knob.BackgroundColor3 = COLORS.text
+    Knob.AnchorPoint = Vector2.new(0.5, 0.5)
+    Knob.Position = UDim2.new(0, 0, 0.5, 0)
+    Knob.Size = UDim2.new(0, 16, 0, 16)
+    Knob.ZIndex = 2
+    Knob.Active = true
+    Knob.Parent = Track
+    corner(Knob, 8)
+    stroke(Knob, COLORS.stroke, 1)
+
+    local currentValue = initialVal
+
+    local function setFromFraction(fraction)
+        fraction = math.clamp(fraction, 0, 1)
+        local value = math.floor(minVal + fraction * (maxVal - minVal) + 0.5)
+        currentValue = value
+        Fill.Size = UDim2.new(fraction, 0, 1, 0)
+        Knob.Position = UDim2.new(fraction, 0, 0.5, 0)
+        ValueLbl.Text = tostring(value) .. " studs/s"
+        onChange(value)
+    end
+
+    local function setFromValue(value)
+        local fraction = (value - minVal) / (maxVal - minVal)
+        setFromFraction(fraction)
+    end
+
+    local dragging = false
+
+    local function updateFromInputPosition(x)
+        local trackPos = Track.AbsolutePosition.X
+        local trackWidth = Track.AbsoluteSize.X
+        if trackWidth <= 0 then return end
+        setFromFraction((x - trackPos) / trackWidth)
+    end
+
+    local function beginDrag(input)
+        dragging = true
+        updateFromInputPosition(input.Position.X)
+    end
+
+    Track.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            beginDrag(input)
+        end
+    end)
+
+    Knob.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            beginDrag(input)
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            updateFromInputPosition(input.Position.X)
+        end
+    end)
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    ValueLbl.MouseButton1Click:Connect(function()
+        if modalCount > 0 then return end
+        prompt("Set " .. labelText, tostring(currentValue), tostring(minVal) .. "-" .. tostring(maxVal), function(text)
+            local n = tonumber(text)
+            if n then
+                n = math.clamp(math.floor(n + 0.5), minVal, maxVal)
+                setFromValue(n)
+            end
+        end)
+    end)
+
+    setFromValue(initialVal)
+
+    return Row, setFromValue
+end
+
+local selectRow, selectBtn, selectDesc = buildActionRow("Egg Type", "Tap to choose eggs", "Select", 1)
+local glideRow, setGlideSpeedSlider = buildSliderRow("Glide Speed", 1, 1000, State.glideSpeed, 2, function(value)
+    State.glideSpeed = value
+    saveState()
+end)
+local teleportRow, teleportBtn, teleportDesc = buildActionRow("Teleport", "Pick at least one egg type", "Go", 3)
+local baseRow, baseBtn, baseDesc = buildActionRow("Base", "Saving location...", "Go", 4)
+local farmRow, farmBtn, farmDesc = buildActionRow("Auto Farm", "Pick an egg type first", "OFF", 5)
+local webhookRow, webhookBtn, webhookDesc = buildActionRow("Webhook", "Not set", "Set", 6)
+local notifyRow, notifyBtn, notifyDesc = buildActionRow("Notify On", "All grabbed eggs", "Select", 7)
+local notifyToggleRow, notifyToggleBtn, notifyToggleDesc = buildActionRow("Notifications", "Set a webhook first", "OFF", 8)
 
 local function openMultiSelectPicker(panelTitle, targetTable, onClose)
     local Overlay = Instance.new("Frame")
@@ -668,6 +806,57 @@ local function getEggPosition(inst)
     return nil
 end
 
+local function glideTo(targetPos, speed)
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not char or not hrp then return false end
+
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    local originalPlatformStand
+    if humanoid then
+        originalPlatformStand = humanoid.PlatformStand
+        humanoid.PlatformStand = true
+    end
+
+    local originalCollide = {}
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            originalCollide[part] = part.CanCollide
+            part.CanCollide = false
+        end
+    end
+
+    local reached = false
+    while char.Parent and hrp.Parent do
+        local currentPos = hrp.Position
+        local diff = targetPos - currentPos
+        local dist = diff.Magnitude
+        if dist < 1 then
+            hrp.CFrame = CFrame.new(targetPos)
+            reached = true
+            break
+        end
+        local dt = task.wait()
+        local step = math.min(dist, (speed or 500) * dt)
+        local dir = diff.Unit
+        local newPos = currentPos + dir * step
+        hrp.CFrame = CFrame.new(newPos, newPos + dir)
+        hrp.Velocity = Vector3.new()
+        hrp.RotVelocity = Vector3.new()
+    end
+
+    for part, wasCollide in pairs(originalCollide) do
+        if part and part.Parent then
+            part.CanCollide = wasCollide
+        end
+    end
+    if humanoid and humanoid.Parent then
+        humanoid.PlatformStand = originalPlatformStand
+    end
+
+    return reached
+end
+
 local function findNearestAmongSelected(selectedSet)
     local hrp = getHRP()
     if not hrp then
@@ -716,10 +905,11 @@ teleportBtn.MouseButton1Click:Connect(function()
     local nearest, dist, name = findNearestAmongSelected(selectedEggs)
     if nearest then
         local pos = getEggPosition(nearest)
-        hrp.CFrame = CFrame.new(pos) + Vector3.new(0, 3, 0)
-        hrp.Velocity = Vector3.new()
-        hrp.RotVelocity = Vector3.new()
-        teleportDesc.Text = string.format("At %s (%.0f studs)", name, dist)
+        teleportDesc.Text = "Gliding to " .. name .. "..."
+        local reached = glideTo(pos, State.glideSpeed)
+        teleportDesc.Text = reached
+            and string.format("At %s (%.0f studs)", name, dist)
+            or "Glide interrupted"
     else
         teleportDesc.Text = "No matching eggs found (check console)"
     end
@@ -749,10 +939,9 @@ baseBtn.MouseButton1Click:Connect(function()
         baseDesc.Text = "Character not found"
         return
     end
-    hrp.CFrame = baseCFrame
-    hrp.Velocity = Vector3.new()
-    hrp.RotVelocity = Vector3.new()
-    baseDesc.Text = "Teleported to base"
+    baseDesc.Text = "Gliding to base..."
+    local reached = glideTo(baseCFrame.Position, State.glideSpeed)
+    baseDesc.Text = reached and "Arrived at base" or "Glide interrupted"
 end)
 
 local function findRequestFunction()
@@ -1045,22 +1234,17 @@ task.spawn(function()
         elseif farmEnabled and countTable(selectedEggs) > 0 and modalCount == 0 then
             local nearest, dist, name = findNearestAmongSelected(selectedEggs)
             if nearest then
-                local hrp = getHRP()
-                if hrp then
-                    local pos = getEggPosition(nearest)
-                    hrp.CFrame = CFrame.new(pos) + Vector3.new(0, 3, 0)
-                    hrp.Velocity = Vector3.new()
-                    hrp.RotVelocity = Vector3.new()
+                local pos = getEggPosition(nearest)
+                farmDesc.Text = "Gliding to " .. name .. "..."
+                local arrivedAtEgg = glideTo(pos, State.glideSpeed)
+
+                if arrivedAtEgg then
                     farmDesc.Text = "Grabbing " .. name .. "..."
 
                     local grabbed = attemptGrab(nearest, 6)
 
-                    local hrp2 = getHRP()
-                    if hrp2 then
-                        hrp2.CFrame = baseCFrame
-                        hrp2.Velocity = Vector3.new()
-                        hrp2.RotVelocity = Vector3.new()
-                    end
+                    farmDesc.Text = "Gliding back to base..."
+                    glideTo(baseCFrame.Position, State.glideSpeed)
 
                     if grabbed then
                         farmDesc.Text = "Grabbed " .. name
@@ -1070,6 +1254,8 @@ task.spawn(function()
                     else
                         farmDesc.Text = "Couldn't grab " .. name .. " (check console)"
                     end
+                else
+                    farmDesc.Text = "Glide interrupted"
                 end
             else
                 farmDesc.Text = "No matching eggs found"
