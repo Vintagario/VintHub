@@ -1,16 +1,65 @@
+--[[
+    Server Hop (optimized rewrite)
+
+    Changes vs. original:
+      * No per-frame Heartbeat loop (gradients spin via looping tweens)
+      * HTTP runs off the UI thread, uses `request` when available, handles 429s,
+        has a search cooldown and pagination
+      * "Random Server" now samples up to 3 pages in a random sort order
+      * One shared action state: only one teleport at a time, errors go to the right row
+      * Duplicate-execution guard + full cleanup of connections on destroy
+      * Fixed minimize race, drag is clamped to the screen, drag listener only runs while dragging
+      * Join-by-ID validates the GUID and can be cancelled
+      * Private server aware rejoin (see notes in the Rejoin row)
+      * Optional auto-reload after teleport (queue_on_teleport)
+]]
+
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
+----------------------------------------------------------------------
+-- Config
+----------------------------------------------------------------------
+local SCRIPT_URL = "https://raw.githubusercontent.com/Vintagario/VintHub/refs/heads/main/Server%20Hop.lua"
+local AUTO_RELOAD = true        -- re-run this script after each teleport (needs queue_on_teleport)
+local SEARCH_COOLDOWN = 2       -- seconds between server list requests (avoids 429s)
+local TELEPORT_TIMEOUT = 25     -- seconds before the UI unlocks if nothing happened
+local RANDOM_PAGES = 3          -- pages of 100 servers sampled for "Random Server"
+
+----------------------------------------------------------------------
+-- Setup
+----------------------------------------------------------------------
 local LocalPlayer = Players.LocalPlayer
 local placeId = game.PlaceId
+local IS_PRIVATE = game.PrivateServerId ~= ""
+
+local okContainer, container = pcall(function()
+    return (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not okContainer or not container then
+    container = LocalPlayer:WaitForChild("PlayerGui")
+end
+
+-- Duplicate-execution guard (old instance cleans up its own connections on Destroying)
+local old = container:FindFirstChild("ServerHopGui")
+if old then
+    old:Destroy()
+end
+
+local cleanups = {}
+local function track(conn)
+    table.insert(cleanups, function()
+        conn:Disconnect()
+    end)
+    return conn
+end
 
 local function getJobId()
     return game.JobId
@@ -33,9 +82,19 @@ local COLORS = {
     stroke = Color3.fromRGB(44, 48, 90),
 }
 
+----------------------------------------------------------------------
+-- UI helpers
+----------------------------------------------------------------------
 local function corner(parent, radius)
     local c = Instance.new("UICorner")
     c.CornerRadius = UDim.new(0, radius or 10)
+    c.Parent = parent
+    return c
+end
+
+local function circle(parent)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0.5, 0)
     c.Parent = parent
     return c
 end
@@ -57,29 +116,60 @@ local function gradient(parent, c0, c1, rotation)
 end
 
 local function tween(obj, props, time, style, direction)
-    TweenService:Create(
+    local t = TweenService:Create(
         obj,
         TweenInfo.new(time or 0.15, style or Enum.EasingStyle.Quad, direction or Enum.EasingDirection.Out),
         props
+    )
+    t:Play()
+    return t
+end
+
+local function spin(obj, seconds)
+    TweenService:Create(
+        obj,
+        TweenInfo.new(seconds, Enum.EasingStyle.Linear, Enum.EasingDirection.In, -1),
+        { Rotation = 360 }
     ):Play()
 end
 
 local function copyToClipboard(text)
-    if typeof(setclipboard) == "function" then
-        pcall(setclipboard, text)
-        return true
+    local fn = setclipboard or toclipboard
+    if typeof(fn) == "function" then
+        return pcall(fn, text)
     end
     return false
 end
 
+-- Temporarily shows `text` on a label, then restores `restoreText` (unless something else wrote to it)
+local flashTokens = setmetatable({}, { __mode = "k" })
+local function flash(label, text, duration, restoreText)
+    local t = (flashTokens[label] or 0) + 1
+    flashTokens[label] = t
+    label.Text = text
+    task.delay(duration, function()
+        if flashTokens[label] == t and label.Parent then
+            label.Text = restoreText
+        end
+    end)
+end
+
 local modalCount = 0
 
-local container = (gethui and gethui()) or game.CoreGui
-
+----------------------------------------------------------------------
+-- Main window
+----------------------------------------------------------------------
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "ServerHopGui"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.Parent = container
+
+ScreenGui.Destroying:Connect(function()
+    for _, fn in ipairs(cleanups) do
+        pcall(fn)
+    end
+    table.clear(cleanups)
+end)
 
 local Main = Instance.new("Frame")
 Main.Name = "Main"
@@ -99,6 +189,7 @@ StrokeGradient.Color = ColorSequence.new({
     ColorSequenceKeypoint.new(1, COLORS.accentAlt),
 })
 StrokeGradient.Parent = MainStroke
+spin(StrokeGradient, 8)
 
 local MainScale = Instance.new("UIScale")
 MainScale.Scale = 0.88
@@ -111,32 +202,48 @@ Header.Size = UDim2.new(1, 0, 0, 56)
 Header.BackgroundTransparency = 1
 Header.Parent = Main
 
+-- Dragging (listener exists only while a drag is in progress, clamped to the screen)
 do
-    local dragging, dragStart, startPos
+    local dragStart, startPos, moveConn
+
+    local function stopDrag()
+        if moveConn then
+            moveConn:Disconnect()
+            moveConn = nil
+        end
+    end
+    table.insert(cleanups, stopDrag)
+
     local function update(input)
         local delta = input.Position - dragStart
-        Main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
-            startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        local screen = ScreenGui.AbsoluteSize
+        local size = Main.AbsoluteSize
+        local minX = -math.max(screen.X - size.X, 0)
+        local minY = -math.max(screen.Y - size.Y, 0)
+        local x = math.clamp(startPos.X.Offset + delta.X, minX, 0)
+        local y = math.clamp(startPos.Y.Offset + delta.Y, minY, 0)
+        Main.Position = UDim2.new(1, x, 1, y)
     end
 
     Header.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
+            stopDrag()
             dragStart = input.Position
             startPos = Main.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
+
+            moveConn = UserInputService.InputChanged:Connect(function(changed)
+                if changed.UserInputType == Enum.UserInputType.MouseMovement
+                    or changed.UserInputType == Enum.UserInputType.Touch then
+                    update(changed)
                 end
             end)
-        end
-    end)
 
-    UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch) then
-            update(input)
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    stopDrag()
+                end
+            end)
         end
     end)
 end
@@ -148,6 +255,7 @@ LogoBadge.BackgroundColor3 = Color3.new(1, 1, 1)
 LogoBadge.Parent = Header
 corner(LogoBadge, 11)
 local LogoGradient = gradient(LogoBadge, COLORS.accent, COLORS.accentAlt, 45)
+spin(LogoGradient, 4)
 
 local LogoText = Instance.new("TextLabel")
 LogoText.Size = UDim2.new(1, 0, 1, 0)
@@ -182,20 +290,18 @@ SubLabel.AutoButtonColor = false
 SubLabel.BackgroundTransparency = 1
 SubLabel.Position = UDim2.new(0, 58, 0, 31)
 SubLabel.Size = UDim2.new(1, -112, 0, 16)
-SubLabel.Text = "Place " .. tostring(placeId)
+local SUB_DEFAULT = "Place " .. tostring(placeId) .. (IS_PRIVATE and " (Private)" or "")
+SubLabel.Text = SUB_DEFAULT
 SubLabel.Parent = Header
 
 SubLabel.MouseEnter:Connect(function() tween(SubLabel, { TextColor3 = COLORS.cyan }) end)
 SubLabel.MouseLeave:Connect(function() tween(SubLabel, { TextColor3 = COLORS.subtext }) end)
 
-local copyFlashing = false
 SubLabel.MouseButton1Click:Connect(function()
-    if modalCount > 0 or copyFlashing then return end
+    if modalCount > 0 then return end
 
-    local original = "Place " .. tostring(placeId)
     local currentJobId = getJobId()
     local message
-
     if currentJobId == "" then
         message = "No server ID available"
     elseif copyToClipboard(currentJobId) then
@@ -203,13 +309,7 @@ SubLabel.MouseButton1Click:Connect(function()
     else
         message = "Clipboard not supported"
     end
-
-    copyFlashing = true
-    SubLabel.Text = message
-    task.delay(1.2, function()
-        SubLabel.Text = original
-        copyFlashing = false
-    end)
+    flash(SubLabel, message, 1.2, SUB_DEFAULT)
 end)
 
 local MinBtn = Instance.new("TextButton")
@@ -250,6 +350,9 @@ BodyLayout.Padding = UDim.new(0, 8)
 BodyLayout.SortOrder = Enum.SortOrder.LayoutOrder
 BodyLayout.Parent = Body
 
+----------------------------------------------------------------------
+-- Footer / Anti-AFK
+----------------------------------------------------------------------
 local Footer = Instance.new("Frame")
 Footer.Name = "Footer"
 Footer.AnchorPoint = Vector2.new(0, 1)
@@ -267,7 +370,7 @@ Halo.Size = UDim2.new(0, 8, 0, 8)
 Halo.BackgroundColor3 = COLORS.green
 Halo.BackgroundTransparency = 0.4
 Halo.Parent = Footer
-corner(Halo, 11)
+circle(Halo)
 
 local Dot = Instance.new("Frame")
 Dot.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -275,7 +378,7 @@ Dot.Position = UDim2.new(0, 18, 0.5, 0)
 Dot.Size = UDim2.new(0, 8, 0, 8)
 Dot.BackgroundColor3 = COLORS.green
 Dot.Parent = Footer
-corner(Dot, 4)
+circle(Dot)
 
 local FooterLabel = Instance.new("TextLabel")
 FooterLabel.Text = "Anti-AFK Guard"
@@ -306,14 +409,17 @@ PillLabel.TextColor3 = COLORS.green
 PillLabel.Text = "ACTIVE"
 PillLabel.Parent = Pill
 
+local haloTween
 local function startHaloPulse()
+    if haloTween then haloTween:Cancel() end
     Halo.Size = UDim2.new(0, 8, 0, 8)
     Halo.BackgroundTransparency = 0.4
-    local info = TweenInfo.new(1.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, -1, false, 0)
-    TweenService:Create(Halo, info, {
-        Size = UDim2.new(0, 24, 0, 24),
-        BackgroundTransparency = 1,
-    }):Play()
+    haloTween = TweenService:Create(
+        Halo,
+        TweenInfo.new(1.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, -1, false, 0),
+        { Size = UDim2.new(0, 24, 0, 24), BackgroundTransparency = 1 }
+    )
+    haloTween:Play()
 end
 
 local function setPillState(active)
@@ -326,6 +432,7 @@ local function setPillState(active)
         Halo.BackgroundColor3 = COLORS.green
         startHaloPulse()
     else
+        if haloTween then haloTween:Cancel() end
         Pill.BackgroundColor3 = COLORS.redDark
         PillStroke.Color = COLORS.red
         PillLabel.TextColor3 = COLORS.red
@@ -337,11 +444,11 @@ end
 
 local pingToken = 0
 local function flashPing()
-    pingToken = pingToken + 1
+    pingToken += 1
     local myToken = pingToken
     PillLabel.Text = "PINGED"
     task.delay(1.5, function()
-        if pingToken == myToken then
+        if pingToken == myToken and PillLabel.Parent then
             PillLabel.Text = "ACTIVE"
         end
     end)
@@ -357,7 +464,7 @@ local function startAntiAfk(onPing)
         return false
     end
 
-    LocalPlayer.Idled:Connect(function()
+    track(LocalPlayer.Idled:Connect(function()
         pcall(function()
             VirtualUser:CaptureController()
             VirtualUser:ClickButton2(Vector2.new())
@@ -365,19 +472,16 @@ local function startAntiAfk(onPing)
         if onPing then
             onPing()
         end
-    end)
+    end))
 
     return true
 end
 
 setPillState(startAntiAfk(flashPing))
 
-RunService.Heartbeat:Connect(function()
-    local t = os.clock()
-    StrokeGradient.Rotation = (t * 45) % 360
-    LogoGradient.Rotation = (t * 90) % 360
-end)
-
+----------------------------------------------------------------------
+-- Buttons / rows / prompt
+----------------------------------------------------------------------
 local function gradientButton(parent, text, size, position, anchor, zIndex)
     local z = zIndex or 1
 
@@ -423,6 +527,7 @@ local function gradientButton(parent, text, size, position, anchor, zIndex)
     return wrap, btn
 end
 
+-- onClick receives a context table: { btn, desc, idle, default }
 local function buildActionRow(labelText, descText, buttonText, order, onClick, descClickable, iconText)
     local Row = Instance.new("Frame")
     Row.Size = UDim2.new(1, 0, 0, 62)
@@ -446,7 +551,7 @@ local function buildActionRow(labelText, descText, buttonText, order, onClick, d
     Badge.Position = UDim2.new(0, 10, 0.5, -18)
     Badge.BackgroundColor3 = Color3.new(1, 1, 1)
     Badge.Parent = Row
-    corner(Badge, 18)
+    circle(Badge)
     gradient(Badge, COLORS.accent, COLORS.accentAlt, 45)
 
     local BadgeText = Instance.new("TextLabel")
@@ -486,19 +591,21 @@ local function buildActionRow(labelText, descText, buttonText, order, onClick, d
     end
     DescLbl.Parent = Row
 
-    local wrap, ActionBtn = gradientButton(
+    local _, ActionBtn = gradientButton(
         Row,
         buttonText,
         UDim2.new(0, 68, 0, 28),
         UDim2.new(1, -46, 0.5, 0)
     )
 
+    local ctx = { btn = ActionBtn, desc = DescLbl, idle = buttonText, default = descText }
+
     ActionBtn.MouseButton1Click:Connect(function()
         if modalCount > 0 then return end
-        onClick(ActionBtn, DescLbl)
+        task.spawn(onClick, ctx)
     end)
 
-    return Row, ActionBtn, DescLbl
+    return ctx
 end
 
 local function prompt(titleText, defaultText, placeholderText, onConfirm)
@@ -510,7 +617,7 @@ local function prompt(titleText, defaultText, placeholderText, onConfirm)
     Overlay.Active = true
     Overlay.Parent = Main
     corner(Overlay, 16)
-    modalCount = modalCount + 1
+    modalCount += 1
     tween(Overlay, { BackgroundTransparency = 0.4 }, 0.2)
 
     local Box = Instance.new("Frame")
@@ -519,6 +626,7 @@ local function prompt(titleText, defaultText, placeholderText, onConfirm)
     Box.Position = UDim2.new(0.5, 0, 0.5, 0)
     Box.BackgroundColor3 = COLORS.card
     Box.ZIndex = 11
+    Box.Active = true -- sinks clicks so only clicks outside the box cancel
     Box.Parent = Overlay
     corner(Box, 14)
     local BoxStroke = stroke(Box, Color3.new(1, 1, 1), 1.5)
@@ -565,277 +673,408 @@ local function prompt(titleText, defaultText, placeholderText, onConfirm)
     Input.Focused:Connect(function() tween(InputStroke, { Color = COLORS.accent }) end)
     Input.FocusLost:Connect(function() tween(InputStroke, { Color = COLORS.stroke }) end)
 
-    local function finish()
+    local done = false
+    local function close(confirmed)
+        if done then return end
+        done = true
         local text = Input.Text
         Overlay:Destroy()
-        modalCount = modalCount - 1
-        onConfirm(text)
-    end
-
-    local confirmWrap, Confirm = gradientButton(
-        Box,
-        "Confirm",
-        UDim2.new(1, -28, 0, 30),
-        UDim2.new(0.5, 0, 1, -28),
-        Vector2.new(0.5, 0.5),
-        11
-    )
-
-    Confirm.MouseButton1Click:Connect(finish)
-    Input.FocusLost:Connect(function(enterPressed)
-        if enterPressed then finish() end
-    end)
-end
-
-local function fetchPublicServers()
-    local success, serverList = pcall(function()
-        return HttpService:JSONDecode(
-            game:HttpGet("https://games.roblox.com/v1/games/" .. placeId ..
-                "/servers/Public?sortOrder=Asc&limit=100")
-        )
-    end)
-
-    if success and serverList and serverList.data then
-        return serverList.data
-    end
-
-    warn("ServerHop: request failed -> " .. tostring(serverList))
-    return nil
-end
-
-local function findLowestPopServer()
-    local servers = fetchPublicServers()
-    if not servers then return nil end
-
-    local currentJobId = getJobId()
-    local candidates = {}
-    for _, server in ipairs(servers) do
-        if server.playing and server.playing < server.maxPlayers
-            and server.id ~= currentJobId then
-            table.insert(candidates, server)
+        modalCount -= 1
+        if confirmed then
+            onConfirm(text)
         end
     end
 
-    if #candidates == 0 then return nil end
+    -- Cancel button
+    local Cancel = Instance.new("TextButton")
+    Cancel.AnchorPoint = Vector2.new(0, 0.5)
+    Cancel.Position = UDim2.new(0, 14, 1, -28)
+    Cancel.Size = UDim2.new(0.5, -21, 0, 30)
+    Cancel.BackgroundColor3 = COLORS.bg
+    Cancel.Text = "Cancel"
+    Cancel.Font = Enum.Font.GothamBold
+    Cancel.TextSize = 13
+    Cancel.TextColor3 = COLORS.subtext
+    Cancel.AutoButtonColor = false
+    Cancel.ZIndex = 11
+    Cancel.Parent = Box
+    corner(Cancel, 9)
+    stroke(Cancel, COLORS.stroke, 1)
+    Cancel.MouseButton1Click:Connect(function() close(false) end)
+
+    -- Confirm button
+    local _, Confirm = gradientButton(
+        Box,
+        "Confirm",
+        UDim2.new(0.5, -21, 0, 30),
+        UDim2.new(1, -14, 1, -28),
+        Vector2.new(1, 0.5),
+        11
+    )
+    Confirm.MouseButton1Click:Connect(function() close(true) end)
+
+    Input.FocusLost:Connect(function(enterPressed)
+        if enterPressed then close(true) end
+    end)
+
+    Overlay.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            close(false)
+        end
+    end)
+end
+
+----------------------------------------------------------------------
+-- Networking
+----------------------------------------------------------------------
+local requestFn = (syn and syn.request) or (http and http.request) or http_request or request
+
+local function httpGet(url)
+    if requestFn then
+        local ok, res = pcall(requestFn, { Url = url, Method = "GET" })
+        if not ok or type(res) ~= "table" then
+            return nil, nil, "Request failed"
+        end
+        return res.Body, res.StatusCode
+    end
+
+    local ok, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if not ok then
+        return nil, nil, "Request failed"
+    end
+    return body, 200
+end
+
+-- Returns serverList, nextCursor, errorMessage
+local function fetchPage(sortOrder, cursor)
+    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&excludeFullGames=true&limit=100")
+        :format(placeId, sortOrder)
+    if cursor then
+        url ..= "&cursor=" .. HttpService:UrlEncode(cursor)
+    end
+
+    local body, status, reqErr = httpGet(url)
+    if not body then
+        return nil, nil, reqErr
+    end
+    if status == 429 then
+        return nil, nil, "Rate limited - wait a few seconds"
+    end
+    if status and status ~= 200 then
+        return nil, nil, "Roblox API error (" .. tostring(status) .. ")"
+    end
+
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(body)
+    end)
+    if not ok or type(decoded) ~= "table" or type(decoded.data) ~= "table" then
+        return nil, nil, "Bad response from Roblox"
+    end
+
+    return decoded.data, decoded.nextPageCursor
+end
+
+local function collectServers(sortOrder, maxPages)
+    local all = {}
+    local cursor
+    for page = 1, maxPages do
+        local data, nextCursor, err = fetchPage(sortOrder, cursor)
+        if not data then
+            if #all > 0 then break end -- partial results are fine
+            return nil, err
+        end
+        for _, server in ipairs(data) do
+            table.insert(all, server)
+        end
+        cursor = nextCursor
+        if not cursor then break end
+        if page < maxPages then
+            task.wait(0.3)
+        end
+    end
+    return all
+end
+
+local function filterCandidates(list)
+    local currentJobId = getJobId()
+    local out = {}
+    for _, server in ipairs(list) do
+        if type(server.playing) == "number"
+            and type(server.maxPlayers) == "number"
+            and server.playing < server.maxPlayers
+            and server.id ~= currentJobId then
+            table.insert(out, server)
+        end
+    end
+    return out
+end
+
+-- Both finders return (server, errorMessage)
+local function findLowestPopServer()
+    local list, err = collectServers("Asc", 1)
+    if not list then return nil, err end
+
+    local candidates = filterCandidates(list)
+    if #candidates == 0 then return nil, "No open servers found" end
 
     table.sort(candidates, function(a, b)
         if a.playing ~= b.playing then
             return a.playing < b.playing
         end
-        local pa = tonumber(a.ping) or math.huge
-        local pb = tonumber(b.ping) or math.huge
-        return pa < pb
+        return (tonumber(a.ping) or math.huge) < (tonumber(b.ping) or math.huge)
     end)
 
-    local pick = candidates[1]
-    return pick.id, pick.playing, tonumber(pick.ping)
+    return candidates[1]
 end
 
 local function findRandomServer()
-    local servers = fetchPublicServers()
-    if not servers then return nil end
+    local order = (math.random(1, 2) == 1) and "Asc" or "Desc"
+    local list, err = collectServers(order, RANDOM_PAGES)
+    if not list then return nil, err end
 
-    local currentJobId = getJobId()
-    local candidates = {}
-    for _, server in ipairs(servers) do
-        if server.playing and server.playing < server.maxPlayers
-            and server.id ~= currentJobId then
-            table.insert(candidates, server)
-        end
-    end
+    local candidates = filterCandidates(list)
+    if #candidates == 0 then return nil, "No open servers found" end
 
-    if #candidates == 0 then return nil end
-
-    local pick = candidates[math.random(1, #candidates)]
-    return pick.id, pick.playing, tonumber(pick.ping)
+    return candidates[math.random(1, #candidates)]
 end
 
-local function attemptTeleport(targetId, desc, btn, resetFlag, fallbackBtnText)
-    local timedOut = false
+----------------------------------------------------------------------
+-- Shared action state (only one teleport/search at a time)
+----------------------------------------------------------------------
+local active = nil
+local actionCounter = 0
 
-    task.delay(10, function()
-        if desc.Text:find("^Joining") or desc.Text:find("^Rejoining") then
-            timedOut = true
-            desc.Text = "Timed out (server may be gone) - tap to retry"
-            btn.Text = fallbackBtnText
-            resetFlag()
+local function beginAction(ctx, status, failHint)
+    if active then return nil end
+    actionCounter += 1
+    active = { ctx = ctx, token = actionCounter, failHint = failHint }
+    ctx.btn.Text = "..."
+    ctx.desc.Text = status
+    return actionCounter
+end
+
+local function isCurrent(token)
+    return active ~= nil and active.token == token
+end
+
+local function endAction(message)
+    if not active then return end
+    local a = active
+    active = nil
+    a.ctx.btn.Text = a.ctx.idle
+    a.ctx.desc.Text = message
+    task.delay(6, function()
+        if not active and a.ctx.desc.Text == message then
+            a.ctx.desc.Text = a.ctx.default
         end
     end)
+end
 
-    local ok, err = pcall(function()
-        TeleportService:TeleportToPlaceInstance(placeId, targetId, LocalPlayer)
+local function armTimeout(token, message)
+    task.delay(TELEPORT_TIMEOUT, function()
+        if isCurrent(token) then
+            endAction(message or "No response - tap to retry")
+        end
     end)
+end
 
-    if not timedOut and not ok then
-        warn("ServerHop: teleport failed -> " .. tostring(err))
-        desc.Text = "Teleport failed: " .. tostring(err)
-        btn.Text = fallbackBtnText
-        resetFlag()
+local queueTeleport = queue_on_teleport
+    or (syn and syn.queue_on_teleport)
+    or (fluxus and fluxus.queue_on_teleport)
+
+local function queueReload()
+    if AUTO_RELOAD and queueTeleport then
+        pcall(queueTeleport, ('loadstring(game:HttpGet("%s"))()'):format(SCRIPT_URL))
     end
 end
 
-local hopping = false
-local lastHopId = nil
+local function doTeleport(jobId)
+    queueReload()
+    return pcall(function()
+        TeleportService:TeleportToPlaceInstance(placeId, jobId, LocalPlayer)
+    end)
+end
 
-local hopRow, hopBtn, hopDesc = buildActionRow(
+track(TeleportService.TeleportInitFailed:Connect(function(_, teleportResult, errorMessage)
+    warn("ServerHop: teleport init failed ->", teleportResult, errorMessage)
+    if active then
+        local hint = active.failHint
+        endAction(hint or ("Failed (" .. tostring(teleportResult) .. ") - tap to retry"))
+    end
+end))
+
+----------------------------------------------------------------------
+-- Rows
+----------------------------------------------------------------------
+local lastSearch = 0
+
+local function runSearch(ctx, finder, onPick)
+    if active then return end
+
+    if os.clock() - lastSearch < SEARCH_COOLDOWN then
+        flash(ctx.desc, "Slow down - try again in a sec", 1.5, ctx.desc.Text)
+        return
+    end
+
+    local token = beginAction(ctx, "Searching...", "Server full or closed - tap to retry")
+    if not token then return end
+    lastSearch = os.clock()
+
+    local server, err = finder()
+    lastSearch = os.clock()
+
+    if not isCurrent(token) then return end -- timed out while searching
+
+    if not server then
+        onPick(nil)
+        endAction(err or "No server found")
+        return
+    end
+
+    onPick(server.id)
+    local pingValue = tonumber(server.ping)
+    local pingText = pingValue and (", " .. math.floor(pingValue) .. "ms") or ""
+    ctx.desc.Text = "Joining (" .. server.playing .. " players" .. pingText .. ") - tap to copy ID"
+
+    local ok, tpErr = doTeleport(server.id)
+    if not ok then
+        endAction("Teleport failed: " .. tostring(tpErr))
+        return
+    end
+    armTimeout(token)
+end
+
+local function attachCopyOnClick(ctx, getId)
+    ctx.desc.MouseButton1Click:Connect(function()
+        if modalCount > 0 then return end
+        local id = getId()
+        if not id then return end
+        local previous = ctx.desc.Text
+        if copyToClipboard(id) then
+            flash(ctx.desc, "Copied: " .. id, 1.2, previous)
+        end
+    end)
+end
+
+-- Least Players
+local lastHopId
+local hopCtx = buildActionRow(
     "Least Players",
     "Lowest players, best ping as tiebreaker",
     "Hop",
     1,
-    function(btn, desc)
-        if hopping then return end
-        hopping = true
-        btn.Text = "..."
-        desc.Text = "Searching..."
-
-        local serverId, playerCount, ping = findLowestPopServer()
-
-        if serverId then
-            lastHopId = serverId
-            local pingText = ping and (", " .. math.floor(ping) .. "ms") or ""
-            desc.Text = "Joining (" .. playerCount .. " players" .. pingText .. ") - tap to copy ID"
-            attemptTeleport(serverId, desc, btn, function() hopping = false end, "Hop")
-        else
-            lastHopId = nil
-            desc.Text = "No server found"
-            btn.Text = "Hop"
-            hopping = false
-        end
+    function(ctx)
+        runSearch(ctx, findLowestPopServer, function(id) lastHopId = id end)
     end,
     true,
     "L"
 )
+attachCopyOnClick(hopCtx, function() return lastHopId end)
 
-hopDesc.MouseButton1Click:Connect(function()
-    if modalCount > 0 then return end
-    if not lastHopId then return end
-    local original = hopDesc.Text
-    if copyToClipboard(lastHopId) then
-        hopDesc.Text = "Copied: " .. lastHopId
-        task.delay(1.2, function()
-            if hopDesc.Text == "Copied: " .. lastHopId then
-                hopDesc.Text = original
-            end
-        end)
-    end
-end)
-
-local randomHopping = false
-local lastRandomId = nil
-
-local randomRow, randomBtn, randomDesc = buildActionRow(
+-- Random Server
+local lastRandomId
+local randomCtx = buildActionRow(
     "Random Server",
-    "Join any random non-full server",
+    "Join a random non-full server",
     "Hop",
     2,
-    function(btn, desc)
-        if randomHopping then return end
-        randomHopping = true
-        btn.Text = "..."
-        desc.Text = "Searching..."
-
-        local serverId, playerCount = findRandomServer()
-
-        if serverId then
-            lastRandomId = serverId
-            desc.Text = "Joining (" .. playerCount .. " players) - tap to copy ID"
-            attemptTeleport(serverId, desc, btn, function() randomHopping = false end, "Hop")
-        else
-            lastRandomId = nil
-            desc.Text = "No server found"
-            btn.Text = "Hop"
-            randomHopping = false
-        end
+    function(ctx)
+        runSearch(ctx, findRandomServer, function(id) lastRandomId = id end)
     end,
     true,
     "R"
 )
+attachCopyOnClick(randomCtx, function() return lastRandomId end)
 
-randomDesc.MouseButton1Click:Connect(function()
-    if modalCount > 0 then return end
-    if not lastRandomId then return end
-    local original = randomDesc.Text
-    if copyToClipboard(lastRandomId) then
-        randomDesc.Text = "Copied: " .. lastRandomId
-        task.delay(1.2, function()
-            if randomDesc.Text == "Copied: " .. lastRandomId then
-                randomDesc.Text = original
-            end
-        end)
-    end
-end)
+-- Same Server (private-server aware)
+--
+-- NOTE: Rejoining a *private/VIP* server by Job ID is blocked by Roblox for
+-- client scripts (it needs the server's access code, which the client can't
+-- read). In that case this tries anyway, then tells you to use your private
+-- server link. Public servers can also fail to rejoin if you were the only
+-- player in them, because an empty server shuts down.
+local REJOIN_FAIL_HINT = IS_PRIVATE
+    and "Private server: Roblox blocks script rejoin - use your private server link"
+    or "Server closed? Rejoin fails if you were alone in it"
 
-local rejoining = false
-
-local rejoinRow, rejoinBtn, rejoinDesc = buildActionRow(
+buildActionRow(
     "Same Server",
-    "Rejoin this exact server",
+    IS_PRIVATE and "Private server - rejoin may be blocked" or "Rejoin this exact server",
     "Rejoin",
     3,
-    function(btn, desc)
-        if rejoining then return end
-        rejoining = true
-        btn.Text = "..."
-        desc.Text = "Rejoining..."
+    function(ctx)
+        local token = beginAction(ctx, "Rejoining...", REJOIN_FAIL_HINT)
+        if not token then return end
 
-        local currentJobId = getJobId()
-
-        if currentJobId == "" then
-            local ok, err = pcall(function()
+        local jobId = getJobId()
+        local ok, err
+        if jobId == "" then
+            queueReload()
+            ok, err = pcall(function()
                 TeleportService:Teleport(placeId, LocalPlayer)
             end)
-            if not ok then
-                desc.Text = "Teleport failed: " .. tostring(err)
-                btn.Text = "Retry"
-                rejoining = false
-            end
         else
-            attemptTeleport(currentJobId, desc, btn, function() rejoining = false end, "Retry")
+            ok, err = doTeleport(jobId)
         end
+
+        if not ok then
+            endAction(IS_PRIVATE and REJOIN_FAIL_HINT or ("Teleport failed: " .. tostring(err)))
+            return
+        end
+        armTimeout(token, REJOIN_FAIL_HINT)
     end,
     false,
     "S"
 )
 
-TeleportService.TeleportInitFailed:Connect(function(_, teleportResult, errorMessage)
-    warn("Teleport init failed:", teleportResult, errorMessage)
-    rejoinDesc.Text = "Failed (" .. tostring(teleportResult) .. ") - tap to retry"
-    rejoinBtn.Text = "Retry"
-    rejoining = false
-end)
-
-local joiningById = false
-
-local joinByIdRow, joinByIdBtn, joinByIdDesc = buildActionRow(
+-- Join by ID
+buildActionRow(
     "Join by ID",
     "Enter a Job ID to join directly",
     "Join",
     4,
-    function(btn, desc)
-        if joiningById then return end
+    function(ctx)
+        if active then return end
         prompt("Join Server by ID", "", "Job ID (GUID)", function(text)
-            local targetId = text and text:gsub("^%s+", ""):gsub("%s+$", "") or ""
-            if targetId == "" then
-                desc.Text = "Enter a Job ID to join directly"
+            local id = (text or ""):match("^%s*(.-)%s*$")
+            if id == "" then return end
+
+            if not id:match("^%x+%-%x+%-%x+%-%x+%-%x+$") then
+                flash(ctx.desc, "Invalid Job ID format", 2, ctx.default)
                 return
             end
-            joiningById = true
-            btn.Text = "..."
-            desc.Text = "Joining..."
-            attemptTeleport(targetId, desc, btn, function() joiningById = false end, "Join")
+
+            local token = beginAction(ctx, "Joining...", "Server is full, closed, or private")
+            if not token then return end
+
+            local ok, err = doTeleport(id)
+            if not ok then
+                endAction("Teleport failed: " .. tostring(err))
+                return
+            end
+            armTimeout(token)
         end)
     end,
     false,
     "ID"
 )
 
+----------------------------------------------------------------------
+-- Minimize
+----------------------------------------------------------------------
 local EXPANDED_SIZE = Main.Size
 local MINIMIZED_SIZE = UDim2.new(0, 250, 0, 56)
 local minimized = false
+local minToken = 0
 
 local function toggleMinimize()
     if modalCount > 0 then return end
     minimized = not minimized
+    minToken += 1
+    local myToken = minToken
 
     if minimized then
         MinBtn.Text = "+"
@@ -846,8 +1085,10 @@ local function toggleMinimize()
         MinBtn.Text = "—"
         tween(Main, { Size = EXPANDED_SIZE }, 0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
         task.delay(0.2, function()
-            Body.Visible = true
-            Footer.Visible = true
+            if minToken == myToken and not minimized then
+                Body.Visible = true
+                Footer.Visible = true
+            end
         end)
     end
 end
@@ -857,12 +1098,15 @@ MinBtn.MouseButton1Click:Connect(toggleMinimize)
 do
     local lastClick = 0
     Header.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            local now = tick()
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            local now = os.clock()
             if now - lastClick < 0.35 then
                 toggleMinimize()
+                lastClick = 0
+            else
+                lastClick = now
             end
-            lastClick = now
         end
     end)
 end
