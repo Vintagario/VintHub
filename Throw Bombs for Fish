@@ -1,0 +1,909 @@
+-- LocalScript / executor script
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local VirtualUser = game:GetService("VirtualUser")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+---------------------------------------------------------------------
+-- ANTI AFK (always on)
+---------------------------------------------------------------------
+-- 1) Disable any existing Idled handlers (including the game's own), if the executor allows it
+if getconnections then
+	pcall(function()
+		for _, c in ipairs(getconnections(player.Idled)) do
+			c:Disable()
+		end
+	end)
+end
+
+-- 2) Answer Idled with a fake right-click so Roblox sees input
+local function fakeInput()
+	pcall(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new(0, 0))
+	end)
+end
+
+player.Idled:Connect(fakeInput)
+
+-- 3) Backup heartbeat in case Idled doesn't fire
+task.spawn(function()
+	while true do
+		task.wait(60)
+		fakeInput()
+	end
+end)
+
+---------------------------------------------------------------------
+-- CONFIG
+---------------------------------------------------------------------
+local ITEM_NAMES = {
+	"Nuke", "HydrogenBomb", "TsarBomb", "PlasmaBomb", "GravityBomb",
+	"MeteorStrike", "OrbitalLaserStrike", "AsteroidImpact", "AntimatterBomb",
+	"DarkMatterBomb", "BlackHoleBomb", "NeutronStarFragment", "Supernova",
+	"QuasarBlast", "BigBangBomb", "UniverseResetButton",
+}
+
+local ROLL_DELAY = 1.5
+local BUY_WINDOW = 0.5
+local COLLECT_INTERVAL = 30 -- seconds between cash collections
+local COLLECT_STAND_TIME = 1.2 -- seconds to stand on the pad
+local SAVE_FILE = "AutoRollSettings.json"
+
+---------------------------------------------------------------------
+-- SAVE / LOAD (needs writefile/readfile from your executor)
+---------------------------------------------------------------------
+local selected = {}   -- [name] = true
+local autoThrow = false
+local autoCollect = false
+local status = nil    -- set after UI is built
+
+local function loadSettings()
+	if not (isfile and readfile) then return end
+	local ok, data = pcall(function()
+		if isfile(SAVE_FILE) then
+			return HttpService:JSONDecode(readfile(SAVE_FILE))
+		end
+	end)
+	if ok and type(data) == "table" then
+		if type(data.items) == "table" then
+			for _, name in ipairs(data.items) do
+				if table.find(ITEM_NAMES, name) then
+					selected[name] = true
+				end
+			end
+		end
+		autoThrow = data.autoThrow == true
+		autoCollect = data.autoCollect == true
+	end
+end
+
+local function saveSettings()
+	if not writefile then return end
+	local items = {}
+	for name in pairs(selected) do table.insert(items, name) end
+	pcall(function()
+		writefile(SAVE_FILE, HttpService:JSONEncode({
+			items = items,
+			autoThrow = autoThrow,
+			autoCollect = autoCollect,
+		}))
+	end)
+end
+
+loadSettings()
+
+local function setStatus(text)
+	if status then status.Text = text end
+end
+
+---------------------------------------------------------------------
+-- NUMBER PARSING ("1.5M", "$2,300", "4.2B" -> number)
+---------------------------------------------------------------------
+local SUFFIXES = {
+	k = 1e3, m = 1e6, b = 1e9, t = 1e12, qa = 1e15, qi = 1e18,
+	sx = 1e21, sp = 1e24, oc = 1e27, no = 1e30, dc = 1e33,
+}
+
+local function parseNumber(text)
+	if typeof(text) == "number" then return text end
+	if typeof(text) ~= "string" then return nil end
+	text = text:gsub(",", ""):gsub("%s", "")
+	local num, suffix = text:match("(%d+%.?%d*)(%a*)")
+	num = tonumber(num)
+	if not num then return nil end
+	return num * (SUFFIXES[suffix:lower()] or 1)
+end
+
+---------------------------------------------------------------------
+-- WORLD REFERENCES
+---------------------------------------------------------------------
+local rollStands = Workspace:WaitForChild("Map"):WaitForChild("RollStands")
+
+local function getPosition(inst)
+	if inst:IsA("Model") then
+		return inst:GetPivot().Position
+	elseif inst:IsA("BasePart") then
+		return inst.Position
+	end
+end
+
+local function findClosestStand()
+	local char = player.Character or player.CharacterAdded:Wait()
+	local root = char:WaitForChild("HumanoidRootPart")
+	local closest, closestDist
+	for _, stand in ipairs(rollStands:GetChildren()) do
+		if stand.Name:match("^RollStand%d+$") then
+			local pos = getPosition(stand)
+			if pos then
+				local dist = (pos - root.Position).Magnitude
+				if not closestDist or dist < closestDist then
+					closest, closestDist = stand, dist
+				end
+			end
+		end
+	end
+	return closest
+end
+
+task.wait(1)
+local myStand = findClosestStand()
+assert(myStand, "No RollStand found")
+print("Closest stand:", myStand.Name)
+
+local offers = myStand:WaitForChild("Offers")
+local lever = myStand:FindFirstChild("Lever") or rollStands:WaitForChild("Lever")
+
+local cashObj = playerGui:WaitForChild("TheMainFrame"):WaitForChild("Main")
+	:WaitForChild("Bottom"):WaitForChild("Currencies"):WaitForChild("Cash")
+
+local function getCash()
+	if cashObj:IsA("ValueBase") then
+		return parseNumber(cashObj.Value)
+	elseif cashObj:IsA("TextLabel") or cashObj:IsA("TextButton") then
+		return parseNumber(cashObj.Text)
+	end
+	local label = cashObj:FindFirstChildWhichIsA("TextLabel", true)
+	return label and parseNumber(label.Text)
+end
+
+local function getCost(offer)
+	for _, key in ipairs({ "Cost", "Price" }) do
+		local attr = offer:GetAttribute(key)
+		if attr then return parseNumber(attr) end
+	end
+	for _, d in ipairs(offer:GetDescendants()) do
+		local n = d.Name:lower()
+		if d:IsA("ValueBase") and (n:find("cost") or n:find("price")) then
+			return parseNumber(d.Value)
+		end
+	end
+	for _, d in ipairs(offer:GetDescendants()) do
+		if d:IsA("TextLabel") then
+			local n = d.Name:lower()
+			if n:find("cost") or n:find("price") or d.Text:find("%$") then
+				local v = parseNumber(d.Text)
+				if v then return v end
+			end
+		end
+	end
+	return nil
+end
+
+---------------------------------------------------------------------
+-- TASK LOCK (so rolling and collecting never fight over movement)
+---------------------------------------------------------------------
+local busy = false
+local function lock()
+	while busy do task.wait(0.1) end
+	busy = true
+end
+local function unlock()
+	busy = false
+end
+
+---------------------------------------------------------------------
+-- WALKING (goes near the target if out of reach)
+---------------------------------------------------------------------
+local running = false   -- effective state (rollWanted and not autoThrow)
+local rollWanted = false -- what the player toggled
+local collecting = false
+
+-- Returns a step function you call every ~0.1s. It walks toward `target`,
+-- jumps when something blocks the way, and sidesteps if still stuck.
+local function newMover()
+	local state = { lastPos = nil, lastCheck = 0, stuck = 0, side = 1 }
+
+	return function(humanoid, root, target)
+		humanoid:MoveTo(target)
+
+		local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
+		if flat.Magnitude < 0.1 then return end
+		local dir = flat.Unit
+		local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
+
+		-- 1) Something solid straight ahead at knee height -> jump
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { humanoid.Parent }
+		local hit = Workspace:Raycast(root.Position - Vector3.new(0, 1.5, 0), dir * 3.5, params)
+		if hit and hit.Instance.CanCollide and grounded then
+			humanoid.Jump = true
+		end
+
+		-- 2) Not making progress -> jump, and if still stuck, sidestep around it
+		local now = os.clock()
+		if not state.lastPos then
+			state.lastPos, state.lastCheck = root.Position, now
+		end
+		if now - state.lastCheck >= 0.4 then
+			if (root.Position - state.lastPos).Magnitude < 0.5 then
+				state.stuck += 1
+				if grounded then humanoid.Jump = true end
+				if state.stuck >= 3 then
+					local right = dir:Cross(Vector3.yAxis)
+					humanoid:MoveTo(root.Position + right * state.side * 8)
+					state.side = -state.side
+					state.stuck = 0
+					task.wait(0.6)
+				end
+			else
+				state.stuck = 0
+			end
+			state.lastPos, state.lastCheck = root.Position, now
+		end
+	end
+end
+
+local function walkNear(pos, range)
+	local char = player.Character
+	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and root) then return false end
+
+	range = range or 10
+	if (root.Position - pos).Magnitude <= range - 1 then
+		return true -- already close enough
+	end
+
+	local stopDist = math.max(range * 0.6, 3)
+	local step = newMover()
+	local deadline = os.clock() + 20
+	while (running or collecting) and os.clock() < deadline do
+		if (root.Position - pos).Magnitude <= stopDist then break end
+		step(humanoid, root, pos)
+		task.wait(0.1)
+	end
+	humanoid:MoveTo(root.Position) -- stop moving
+	task.wait(0.1)
+
+	return (root.Position - pos).Magnitude <= range
+end
+
+local function promptPosition(prompt)
+	local p = prompt.Parent
+	if p and p:IsA("Attachment") then return p.WorldPosition end
+	if p and p:IsA("BasePart") then return p.Position end
+	return nil
+end
+
+---------------------------------------------------------------------
+-- INTERACTION HELPERS
+---------------------------------------------------------------------
+local function interact(inst)
+	local prompt = inst:FindFirstChildWhichIsA("ProximityPrompt", true)
+	if prompt then
+		local pos = promptPosition(prompt) or getPosition(inst)
+		if pos and not walkNear(pos, prompt.MaxActivationDistance) then
+			return false
+		end
+		if fireproximityprompt then
+			fireproximityprompt(prompt)
+		else
+			prompt:InputHoldBegin()
+			task.wait(prompt.HoldDuration + 0.05)
+			prompt:InputHoldEnd()
+		end
+		return true
+	end
+
+	local click = inst:FindFirstChildWhichIsA("ClickDetector", true)
+	if click and fireclickdetector then
+		local pos = getPosition(inst)
+		if pos and not walkNear(pos, click.MaxActivationDistance) then
+			return false
+		end
+		fireclickdetector(click)
+		return true
+	end
+
+	return false
+end
+
+-- After a purchase the game auto-equips the bomb; unequip it right away.
+local lastBuy = 0
+
+local function hookCharacter(char)
+	char.ChildAdded:Connect(function(child)
+		if child:IsA("Tool") and os.clock() - lastBuy < 3 then
+			task.defer(function()
+				local hum = char:FindFirstChildOfClass("Humanoid")
+				if hum then hum:UnequipTools() end
+			end)
+		end
+	end)
+end
+
+if player.Character then hookCharacter(player.Character) end
+player.CharacterAdded:Connect(hookCharacter)
+
+local function roll()
+	return interact(lever)
+end
+
+-- Returns: "bought", "expensive", or nil
+local function tryBuy()
+	local sawExpensive = false
+	for name in pairs(selected) do
+		local offer = offers:FindFirstChild(name)
+		if offer then
+			local cost = getCost(offer)
+			local cash = getCash()
+			if cost and cash and cost > cash then
+				sawExpensive = true
+			elseif interact(offer) then
+				lastBuy = os.clock()
+				-- in case the tool is already equipped by the time we get here
+				local char = player.Character
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				task.delay(0.3, function()
+					if hum then hum:UnequipTools() end
+				end)
+				return "bought", name
+			end
+		end
+	end
+	return sawExpensive and "expensive" or nil
+end
+
+---------------------------------------------------------------------
+-- AUTO COLLECT CASH (stands on your tank's collect pad)
+---------------------------------------------------------------------
+local claimName, plateName = "Claim", "CollectPlate"
+do
+	local ok, cfg = pcall(function()
+		return require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("Tank"))
+	end)
+	if ok and type(cfg) == "table" then
+		if cfg.ClaimName then claimName = cfg.ClaimName end
+		if type(cfg.CollectPlate) == "table" and cfg.CollectPlate.Name then
+			plateName = cfg.CollectPlate.Name
+		end
+	end
+end
+
+local function getCollectPart()
+	local plot = player:GetAttribute("PlotNumber")
+	local map = Workspace:FindFirstChild("Map")
+	local tanks = map and map:FindFirstChild("FishTanks")
+	local tank = plot and tanks and tanks:FindFirstChild("FishTank" .. plot)
+	local pads = tank and tank:FindFirstChild("Pads")
+	if not pads then return nil end
+
+	local part = pads:FindFirstChild(claimName)
+	if part and part:IsA("BasePart") then return part end
+
+	local collect = pads:FindFirstChild("Collect")
+	part = collect and collect:FindFirstChild(plateName)
+	if part and part:IsA("BasePart") then return part end
+	return nil
+end
+
+local function collectCash()
+	local part = getCollectPart()
+	if not part then
+		setStatus("Collect pad not found")
+		return false
+	end
+
+	local char = player.Character
+	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and root) then return false end
+
+	setStatus("Collecting cash...")
+
+	local flatTol = math.clamp(math.min(part.Size.X, part.Size.Z) / 4, 2, 6)
+	local function flatDist()
+		local d = root.Position - part.Position
+		return Vector3.new(d.X, 0, d.Z).Magnitude
+	end
+
+	local step = newMover()
+	local deadline = os.clock() + 20
+	while collecting and not autoThrow and os.clock() < deadline and flatDist() > flatTol do
+		step(humanoid, root, part.Position)
+		task.wait(0.1)
+	end
+
+	if autoThrow then
+		humanoid:MoveTo(root.Position)
+		return false
+	end
+
+	if flatDist() > flatTol + 2 then
+		humanoid:MoveTo(root.Position)
+		setStatus("Couldn't reach collect pad")
+		return false
+	end
+
+	-- some games also listen for Touched, so try that too
+	if firetouchinterest then
+		pcall(function()
+			firetouchinterest(root, part, 0)
+			firetouchinterest(root, part, 1)
+		end)
+	end
+
+	task.wait(COLLECT_STAND_TIME)
+	setStatus("Collected cash")
+	return true
+end
+
+local lastCollect = 0
+
+task.spawn(function()
+	while true do
+		-- autoCollect is the player's saved preference; it is suspended while Auto Throw is on
+		if autoCollect and not autoThrow and os.clock() - lastCollect >= COLLECT_INTERVAL then
+			lock()
+			collecting = true
+			pcall(collectCash)
+			collecting = false
+			unlock()
+			lastCollect = os.clock()
+		end
+		task.wait(1)
+	end
+end)
+
+---------------------------------------------------------------------
+-- AUTO THROW (perfect throw)
+---------------------------------------------------------------------
+local ThrowCfg, Timing, bestTier
+do
+	local ok, cfg = pcall(function()
+		return require(ReplicatedStorage:WaitForChild("Config"):WaitForChild("Throw"))
+	end)
+	if ok and type(cfg) == "table" and cfg.Timing then
+		ThrowCfg = cfg
+		Timing = cfg.Timing
+		for _, tier in pairs(Timing.Tiers) do
+			if not bestTier or tier.Start > bestTier.Start then
+				bestTier = tier
+			end
+		end
+	else
+		warn("AutoThrow: couldn't load Config.Throw, auto throw disabled")
+	end
+end
+
+local function getTimingParts()
+	local frames = playerGui:FindFirstChild("Frames")
+	local gui = frames and frames:FindFirstChild(Timing.Gui)
+	if not (gui and gui:IsA("GuiObject") and gui.Visible) then return end
+	local timer = gui:FindFirstChild(Timing.Timer)
+	local arrow = timer and (Timing.Arrow == Timing.Timer and timer or timer:FindFirstChild(Timing.Arrow))
+	local button = gui:FindFirstChild(Timing.Button)
+	if arrow and arrow:IsA("GuiObject") and button and button:IsA("GuiButton") then
+		return arrow, button
+	end
+end
+
+local function pressButton(button)
+	if firesignal then
+		firesignal(button.Activated)
+		return true
+	elseif getconnections then
+		for _, c in ipairs(getconnections(button.Activated)) do c:Fire() end
+		return true
+	end
+	return false
+end
+
+local lastThrow = 0
+local armed = false -- only true once we've seen a fresh, non-perfect arrow position
+
+RunService.RenderStepped:Connect(function()
+	if not autoThrow or not ThrowCfg or not bestTier then
+		armed = false
+		return
+	end
+
+	local arrow, button = getTimingParts()
+	if not arrow then
+		-- Throw UI is hidden (throwing, cutscene, not carrying): reset
+		armed = false
+		return
+	end
+
+	if os.clock() - lastThrow < 0.5 then return end
+
+	local fill = arrow.Position.X.Scale
+	local tier = ThrowCfg.TimingTier(fill)
+	if not tier then return end
+
+	if tier.Name ~= bestTier.Name then
+		-- Arrow is somewhere below perfect, so this is a live reading. Arm.
+		armed = true
+		return
+	end
+
+	-- Arrow is in the perfect tier. Only press if we saw it climb there this round.
+	if armed and pressButton(button) then
+		armed = false
+		lastThrow = os.clock()
+		setStatus("Perfect throw: " .. tier.Name)
+	end
+end)
+
+---------------------------------------------------------------------
+-- AUTO EQUIP HIGHEST BOMB (while Auto Throw is ON)
+---------------------------------------------------------------------
+-- Rank = position in ITEM_NAMES (later = better). Matches tool names
+-- ignoring case, spaces and underscores, so "Universe Reset Button x5" still matches.
+local function bombRank(toolName)
+	local lower = (toolName:lower():gsub("[%s_%-]", ""))
+	local best, bestLen = nil, 0
+	for i, n in ipairs(ITEM_NAMES) do
+		local key = n:lower()
+		-- "Shiny Plasma Bomb" -> "shinyplasmabomb" still contains "plasmabomb".
+		-- Longest match wins, so a mutation word can't be mistaken for another bomb.
+		if #key > bestLen and lower:find(key, 1, true) then
+			best, bestLen = i, #key
+		end
+	end
+	return best
+end
+
+local function bestOwnedTool()
+	local char = player.Character
+	local backpack = player:FindFirstChildOfClass("Backpack")
+	local bestTool, bestRank
+	for _, container in ipairs({ char, backpack }) do
+		if container then
+			for _, tool in ipairs(container:GetChildren()) do
+				if tool:IsA("Tool") then
+					local r = bombRank(tool.Name)
+					if r and (not bestRank or r > bestRank) then
+						bestTool, bestRank = tool, r
+					end
+				end
+			end
+		end
+	end
+	return bestTool, bestRank
+end
+
+task.spawn(function()
+	while true do
+		task.wait(0.5)
+		-- skip during throw cutscenes (the game shows a "Letterbox" gui then)
+		if autoThrow and ThrowCfg
+			and not playerGui:FindFirstChild("Letterbox")
+			and os.clock() - lastThrow > 2 then
+			pcall(function()
+				local char = player.Character
+				local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+				if not humanoid or humanoid.Health <= 0 then return end
+
+				local tool = bestOwnedTool()
+				if tool and tool.Parent ~= char then
+					humanoid:EquipTool(tool)
+					setStatus("Equipped " .. tool.Name)
+				end
+			end)
+		end
+	end
+end)
+
+---------------------------------------------------------------------
+-- UI (always on top)
+---------------------------------------------------------------------
+local FULL_SIZE = UDim2.fromOffset(240, 230)
+local MINI_SIZE = UDim2.fromOffset(240, 28)
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "AutoRollGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
+
+-- CoreGui / gethui render above every PlayerGui, so nothing in the game can cover it
+local parented = false
+if gethui then
+	parented = pcall(function() gui.Parent = gethui() end) and gui.Parent ~= nil
+end
+if not parented then
+	parented = pcall(function() gui.Parent = game:GetService("CoreGui") end) and gui.Parent ~= nil
+end
+if not parented then
+	gui.Parent = playerGui
+end
+
+local frame = Instance.new("Frame")
+frame.Size = FULL_SIZE
+frame.Position = UDim2.new(0, 20, 0.5, -115)
+frame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.Size = UDim2.fromScale(1, 1)
+body.BackgroundTransparency = 1
+body.Parent = frame
+
+local function makeLabel(text, y, h, size, font, color)
+	local l = Instance.new("TextLabel")
+	l.Size = UDim2.new(1, -20, 0, h)
+	l.Position = UDim2.fromOffset(10, y)
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextColor3 = color or Color3.new(1, 1, 1)
+	l.Font = font
+	l.TextSize = size
+	l.Parent = body
+	return l
+end
+
+local function makeButton(text, y, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, -20, 0, 30)
+	b.Position = UDim2.fromOffset(10, y)
+	b.BackgroundColor3 = color
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 14
+	b.Text = text
+	b.Parent = body
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+	return b
+end
+
+local RED, GREEN = Color3.fromRGB(180, 60, 60), Color3.fromRGB(60, 160, 80)
+
+-- Title bar + minimize button (these stay visible when minimized)
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -36, 0, 28)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "Auto Roll"
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.Parent = frame
+
+local minBtn = Instance.new("TextButton")
+minBtn.Size = UDim2.fromOffset(24, 20)
+minBtn.Position = UDim2.new(1, -30, 0, 4)
+minBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
+minBtn.TextColor3 = Color3.new(1, 1, 1)
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 16
+minBtn.Text = "–"
+minBtn.Parent = frame
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 5)
+
+local dropBtn = makeButton("Select items  ▼", 34, Color3.fromRGB(50, 50, 58))
+dropBtn.Font = Enum.Font.Gotham
+
+local toggleBtn = makeButton("Auto Roll: OFF", 72, RED)
+local throwBtn = makeButton("Auto Throw: OFF", 110, RED)
+local collectBtn = makeButton("Auto Collect: OFF", 148, RED)
+
+status = makeLabel("Idle", 186, 36, 12, Enum.Font.Gotham, Color3.fromRGB(200, 200, 200))
+status.TextWrapped = true
+
+-- Multi-select dropdown list
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, -20, 0, 150)
+list.Position = UDim2.fromOffset(10, 66)
+list.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 4
+list.Visible = false
+list.ZIndex = 5
+list.CanvasSize = UDim2.new(0, 0, 0, #ITEM_NAMES * 26)
+list.Parent = body
+
+Instance.new("UIListLayout", list).SortOrder = Enum.SortOrder.LayoutOrder
+
+local function updateDropText()
+	local count = 0
+	for _ in pairs(selected) do count += 1 end
+	dropBtn.Text = (count == 0 and "Select items" or (count .. " selected")) .. "  ▼"
+end
+
+local function styleOption(opt, name)
+	if selected[name] then
+		opt.Text = "☑  " .. name
+		opt.TextColor3 = Color3.fromRGB(90, 220, 120)
+	else
+		opt.Text = "☐  " .. name
+		opt.TextColor3 = Color3.new(1, 1, 1)
+	end
+end
+
+for i, name in ipairs(ITEM_NAMES) do
+	local opt = Instance.new("TextButton")
+	opt.Size = UDim2.new(1, 0, 0, 26)
+	opt.LayoutOrder = i
+	opt.BackgroundTransparency = 1
+	opt.Font = Enum.Font.Gotham
+	opt.TextSize = 13
+	opt.TextXAlignment = Enum.TextXAlignment.Left
+	opt.ZIndex = 6
+	opt.Parent = list
+	styleOption(opt, name)
+
+	opt.MouseButton1Click:Connect(function()
+		selected[name] = (not selected[name]) or nil
+		styleOption(opt, name)
+		updateDropText()
+		saveSettings()
+	end)
+end
+updateDropText()
+
+dropBtn.MouseButton1Click:Connect(function()
+	list.Visible = not list.Visible
+end)
+
+-- Minimize
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	list.Visible = false
+	body.Visible = not minimized
+	frame.Size = minimized and MINI_SIZE or FULL_SIZE
+	minBtn.Text = minimized and "+" or "–"
+end)
+
+local refreshCollectBtn -- defined below; the throw button needs to update it
+local refreshRollBtn     -- same for the roll button
+
+-- Auto throw button
+local function refreshThrowBtn()
+	throwBtn.Text = autoThrow and "Auto Throw: ON" or "Auto Throw: OFF"
+	throwBtn.BackgroundColor3 = autoThrow and GREEN or RED
+end
+refreshThrowBtn()
+
+throwBtn.MouseButton1Click:Connect(function()
+	if not ThrowCfg then
+		setStatus("Throw config not found")
+		return
+	end
+	autoThrow = not autoThrow
+	armed = false
+	if not autoThrow then
+		lastCollect = 0 -- if Auto Collect was on before, it resumes right away
+	end
+	refreshThrowBtn()
+	refreshCollectBtn()
+	refreshRollBtn()
+	saveSettings()
+	list.Visible = false
+end)
+
+-- Auto collect button
+function refreshCollectBtn()
+	if autoThrow then
+		-- locked while Auto Throw is on; "PAUSED" means it was ON and will resume
+		collectBtn.Text = autoCollect and "Collect: PAUSED" or "Collect: LOCKED"
+		collectBtn.BackgroundColor3 = Color3.fromRGB(90, 90, 95)
+	else
+		collectBtn.Text = autoCollect and "Auto Collect: ON" or "Auto Collect: OFF"
+		collectBtn.BackgroundColor3 = autoCollect and GREEN or RED
+	end
+end
+refreshCollectBtn()
+
+collectBtn.MouseButton1Click:Connect(function()
+	if autoThrow then
+		setStatus("Turn off Auto Throw to use Auto Collect")
+		return
+	end
+	autoCollect = not autoCollect
+	lastCollect = 0 -- collect right away when turned on
+	refreshCollectBtn()
+	saveSettings()
+	list.Visible = false
+end)
+
+---------------------------------------------------------------------
+-- MAIN LOOP (auto roll / buy)
+---------------------------------------------------------------------
+function refreshRollBtn()
+	running = rollWanted and not autoThrow
+	if autoThrow then
+		-- locked while Auto Throw is on; "PAUSED" means it was ON and will resume
+		toggleBtn.Text = rollWanted and "Roll: PAUSED" or "Roll: LOCKED"
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(90, 90, 95)
+	else
+		toggleBtn.Text = rollWanted and "Auto Roll: ON" or "Auto Roll: OFF"
+		toggleBtn.BackgroundColor3 = rollWanted and GREEN or RED
+	end
+end
+refreshRollBtn()
+
+toggleBtn.MouseButton1Click:Connect(function()
+	if autoThrow then
+		setStatus("Turn off Auto Throw to use Auto Roll")
+		return
+	end
+	rollWanted = not rollWanted
+	refreshRollBtn()
+	setStatus(running and "Running..." or "Idle")
+	list.Visible = false
+end)
+
+local function rollIteration()
+	local result, name = tryBuy()
+	if result == "bought" then
+		setStatus("Bought " .. name)
+		return
+	end
+
+	if result == "expensive" then
+		setStatus("Too expensive, rerolling")
+	end
+
+	if not roll() then
+		setStatus("Can't reach/trigger lever")
+		task.wait(2)
+		return
+	end
+
+	task.wait(BUY_WINDOW)
+	result, name = tryBuy()
+	if result == "bought" then
+		setStatus("Bought " .. name)
+	elseif result == "expensive" then
+		setStatus("Too expensive, skipped")
+	else
+		setStatus("Rolling...")
+	end
+end
+
+task.spawn(function()
+	while true do
+		if running then
+			if next(selected) == nil then
+				setStatus("Select at least one item")
+				task.wait(0.5)
+			else
+				lock()
+				pcall(rollIteration)
+				unlock()
+				task.wait(ROLL_DELAY) -- lock is free here so collecting can slot in
+			end
+		else
+			task.wait(0.25)
+		end
+	end
+end)
