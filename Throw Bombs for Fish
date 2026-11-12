@@ -1,4 +1,4 @@
--- LocalScript / executor script
+-- VintHub | LocalScript / executor script
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -6,14 +6,48 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local VirtualUser = game:GetService("VirtualUser")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
 ---------------------------------------------------------------------
+-- SINGLE INSTANCE (re-executing closes the previous copy, then reloads)
+---------------------------------------------------------------------
+local env = (getgenv and getgenv()) or _G
+if type(env.VintHubCleanup) == "function" then
+	pcall(env.VintHubCleanup)
+	task.wait(0.5) -- give the old loops a moment to exit
+end
+
+local alive = true
+local connections, extras = {}, {}
+local function track(conn)
+	table.insert(connections, conn)
+	return conn
+end
+
+env.VintHubCleanup = function()
+	alive = false
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	for _, f in ipairs(extras) do
+		pcall(f)
+	end
+end
+
+-- stop walking when closed
+table.insert(extras, function()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if hum and root then hum:MoveTo(root.Position) end
+end)
+
+---------------------------------------------------------------------
 -- ANTI AFK (always on)
 ---------------------------------------------------------------------
--- 1) Disable any existing Idled handlers (including the game's own), if the executor allows it
 if getconnections then
 	pcall(function()
 		for _, c in ipairs(getconnections(player.Idled)) do
@@ -22,7 +56,6 @@ if getconnections then
 	end)
 end
 
--- 2) Answer Idled with a fake right-click so Roblox sees input
 local function fakeInput()
 	pcall(function()
 		VirtualUser:CaptureController()
@@ -30,11 +63,10 @@ local function fakeInput()
 	end)
 end
 
-player.Idled:Connect(fakeInput)
+track(player.Idled:Connect(fakeInput))
 
--- 3) Backup heartbeat in case Idled doesn't fire
 task.spawn(function()
-	while true do
+	while alive do
 		task.wait(60)
 		fakeInput()
 	end
@@ -54,6 +86,8 @@ local ROLL_DELAY = 1.5
 local BUY_WINDOW = 0.5
 local COLLECT_INTERVAL = 30 -- seconds between cash collections
 local COLLECT_STAND_TIME = 1.2 -- seconds to stand on the pad
+local FISH_SELL_BUFFER = 5 -- Auto Farm: equip best + sell when this many slots from a full fish inventory
+local FARM_SPOT_TOL = 4 -- Auto Farm: how close (studs) to the lookout centre counts as "there"
 local SAVE_FILE = "AutoRollSettings.json"
 
 ---------------------------------------------------------------------
@@ -62,7 +96,15 @@ local SAVE_FILE = "AutoRollSettings.json"
 local selected = {}   -- [name] = true
 local autoThrow = false
 local autoCollect = false
-local status = nil    -- set after UI is built
+local autoSpin = false
+local autoFarm = false
+local farmPhase = "roll" -- "roll" (roll + collect) or "throw" (walk to lookout + throw)
+local statusSetter = nil -- set after the UI is built
+
+-- true whenever the throw logic (timing press + equip best bomb) should run
+local function throwActive()
+	return autoThrow or (autoFarm and farmPhase == "throw")
+end
 
 local function loadSettings()
 	if not (isfile and readfile) then return end
@@ -81,6 +123,8 @@ local function loadSettings()
 		end
 		autoThrow = data.autoThrow == true
 		autoCollect = data.autoCollect == true
+		autoSpin = data.autoSpin == true
+		autoFarm = data.autoFarm == true
 	end
 end
 
@@ -93,6 +137,8 @@ local function saveSettings()
 			items = items,
 			autoThrow = autoThrow,
 			autoCollect = autoCollect,
+			autoSpin = autoSpin,
+			autoFarm = autoFarm,
 		}))
 	end)
 end
@@ -100,7 +146,7 @@ end
 loadSettings()
 
 local function setStatus(text)
-	if status then status.Text = text end
+	if statusSetter then statusSetter(text) end
 end
 
 ---------------------------------------------------------------------
@@ -174,6 +220,12 @@ local function getCash()
 end
 
 local function getCost(offer)
+	local prompt = offer:FindFirstChildWhichIsA("ProximityPrompt", true)
+	if prompt and prompt.ActionText:find("%d") then
+		local v = parseNumber(prompt.ActionText)
+		if v then return v end
+	end
+
 	for _, key in ipairs({ "Cost", "Price" }) do
 		local attr = offer:GetAttribute(key)
 		if attr then return parseNumber(attr) end
@@ -197,7 +249,7 @@ local function getCost(offer)
 end
 
 ---------------------------------------------------------------------
--- TASK LOCK (so rolling and collecting never fight over movement)
+-- TASK LOCK (so rolling, collecting and farm walking never fight over movement)
 ---------------------------------------------------------------------
 local busy = false
 local function lock()
@@ -211,12 +263,17 @@ end
 ---------------------------------------------------------------------
 -- WALKING (goes near the target if out of reach)
 ---------------------------------------------------------------------
-local running = false   -- effective state (rollWanted and not autoThrow)
+local running = false   -- effective state: should the roll loop run right now
 local rollWanted = false -- what the player toggled
 local collecting = false
 
--- Returns a step function you call every ~0.1s. It walks toward `target`,
--- jumps when something blocks the way, and sidesteps if still stuck.
+-- Auto Farm drives rolling during its "roll" phase; manual Auto Throw suspends everything
+local function recomputeRunning()
+	local farmRoll = autoFarm and farmPhase == "roll"
+	local farmThrow = autoFarm and farmPhase == "throw"
+	running = (rollWanted or farmRoll) and not autoThrow and not farmThrow
+end
+
 local function newMover()
 	local state = { lastPos = nil, lastCheck = 0, stuck = 0, side = 1 }
 
@@ -228,7 +285,6 @@ local function newMover()
 		local dir = flat.Unit
 		local grounded = humanoid.FloorMaterial ~= Enum.Material.Air
 
-		-- 1) Something solid straight ahead at knee height -> jump
 		local params = RaycastParams.new()
 		params.FilterType = Enum.RaycastFilterType.Exclude
 		params.FilterDescendantsInstances = { humanoid.Parent }
@@ -237,7 +293,6 @@ local function newMover()
 			humanoid.Jump = true
 		end
 
-		-- 2) Not making progress -> jump, and if still stuck, sidestep around it
 		local now = os.clock()
 		if not state.lastPos then
 			state.lastPos, state.lastCheck = root.Position, now
@@ -269,7 +324,7 @@ local function walkNear(pos, range)
 
 	range = range or 10
 	if (root.Position - pos).Magnitude <= range - 1 then
-		return true -- already close enough
+		return true
 	end
 
 	local stopDist = math.max(range * 0.6, 3)
@@ -280,7 +335,7 @@ local function walkNear(pos, range)
 		step(humanoid, root, pos)
 		task.wait(0.1)
 	end
-	humanoid:MoveTo(root.Position) -- stop moving
+	humanoid:MoveTo(root.Position)
 	task.wait(0.1)
 
 	return (root.Position - pos).Magnitude <= range
@@ -341,7 +396,7 @@ local function hookCharacter(char)
 end
 
 if player.Character then hookCharacter(player.Character) end
-player.CharacterAdded:Connect(hookCharacter)
+track(player.CharacterAdded:Connect(hookCharacter))
 
 local function roll()
 	return interact(lever)
@@ -359,7 +414,6 @@ local function tryBuy()
 				sawExpensive = true
 			elseif interact(offer) then
 				lastBuy = os.clock()
-				-- in case the tool is already equipped by the time we get here
 				local char = player.Character
 				local hum = char and char:FindFirstChildOfClass("Humanoid")
 				task.delay(0.3, function()
@@ -427,12 +481,12 @@ local function collectCash()
 
 	local step = newMover()
 	local deadline = os.clock() + 20
-	while collecting and not autoThrow and os.clock() < deadline and flatDist() > flatTol do
+	while collecting and not throwActive() and os.clock() < deadline and flatDist() > flatTol do
 		step(humanoid, root, part.Position)
 		task.wait(0.1)
 	end
 
-	if autoThrow then
+	if throwActive() then
 		humanoid:MoveTo(root.Position)
 		return false
 	end
@@ -443,7 +497,6 @@ local function collectCash()
 		return false
 	end
 
-	-- some games also listen for Touched, so try that too
 	if firetouchinterest then
 		pcall(function()
 			firetouchinterest(root, part, 0)
@@ -459,17 +512,95 @@ end
 local lastCollect = 0
 
 task.spawn(function()
-	while true do
-		-- autoCollect is the player's saved preference; it is suspended while Auto Throw is on
-		if autoCollect and not autoThrow and os.clock() - lastCollect >= COLLECT_INTERVAL then
+	while alive do
+		-- collect when the player wants it, or while Auto Farm is in its roll phase;
+		-- always suspended while throwing
+		local wantCollect = (autoCollect or autoFarm) and not throwActive()
+		if wantCollect and os.clock() - lastCollect >= COLLECT_INTERVAL then
 			lock()
-			collecting = true
-			pcall(collectCash)
-			collecting = false
+			-- state may have changed while we waited for the lock
+			if (autoCollect or autoFarm) and not throwActive() then
+				collecting = true
+				pcall(collectCash)
+				collecting = false
+			end
 			unlock()
 			lastCollect = os.clock()
 		end
 		task.wait(1)
+	end
+end)
+
+---------------------------------------------------------------------
+-- AUTO SPIN WHEEL (uses the game's remotes, no walking)
+---------------------------------------------------------------------
+local Remotes, WheelCfg, DataCtl
+pcall(function()
+	Remotes = require(ReplicatedStorage:WaitForChild("Remotes", 5))
+end)
+pcall(function()
+	WheelCfg = require(ReplicatedStorage:WaitForChild("Config", 5):WaitForChild("Wheel", 5))
+end)
+pcall(function()
+	DataCtl = require(player:WaitForChild("PlayerScripts"):WaitForChild("Controllers", 5):WaitForChild("DataController", 5))
+end)
+
+local SPIN_WAIT = (WheelCfg and WheelCfg.Time and WheelCfg.HoldTime)
+	and (WheelCfg.Time + WheelCfg.HoldTime + 0.5) or 6
+
+local SKIP_ANIMATION = true
+local SKIP_GAP = 0.4
+
+local spinResult = nil
+if Remotes then
+	pcall(function()
+		track(Remotes.get("WheelResult").OnClientEvent:Connect(function(index)
+			spinResult = index
+		end))
+	end)
+end
+
+local function getSpins()
+	if not DataCtl then return nil end
+	local ok, w = pcall(DataCtl.Get, "Wheel")
+	if ok and type(w) == "table" and type(w.Spins) == "number" then
+		return w.Spins
+	end
+	return nil
+end
+
+task.spawn(function()
+	while alive do
+		if autoSpin and Remotes then
+			local spins = getSpins()
+			if spins == nil or spins > 0 then
+				spinResult = nil
+				pcall(function() Remotes.get("WheelSpin"):FireServer() end)
+
+				local t0 = os.clock()
+				while not spinResult and os.clock() - t0 < 3 do
+					task.wait(0.05)
+				end
+
+				if spinResult then
+					setStatus("Wheel spun (reward " .. tostring(spinResult) .. ")")
+					if SKIP_ANIMATION then
+						task.wait(0.15)
+						pcall(function() Remotes.get("WheelSkip"):FireServer() end)
+						task.wait(SKIP_GAP)
+					else
+						task.wait(SPIN_WAIT)
+					end
+				else
+					setStatus("Wheel: no result (no spins?)")
+					task.wait(5)
+				end
+			else
+				task.wait(3)
+			end
+		else
+			task.wait(0.5)
+		end
 	end
 end)
 
@@ -518,72 +649,231 @@ local function pressButton(button)
 end
 
 local lastThrow = 0
-local armed = false -- only true once we've seen a fresh, non-perfect arrow position
+local armed = false
+local lastFullMsg = 0
 
-RunService.RenderStepped:Connect(function()
-	if not autoThrow or not ThrowCfg or not bestTier then
+-- Inventory.Fish vs Inventory.MaxFish (same numbers the game's inventory window shows)
+-- returns fish count, max (nil if the data can't be read)
+local function fishCount()
+	if not DataCtl then return nil end
+	local ok, inv = pcall(DataCtl.Get, "Inventory")
+	if ok and type(inv) == "table" and type(inv.Fish) == "table" then
+		return #inv.Fish, tonumber(inv.MaxFish)
+	end
+	return nil
+end
+
+-- buffer = how many slots before max still counts as "full" (0 = completely full)
+local function fishInventoryFull(buffer)
+	local n, max = fishCount()
+	return n ~= nil and max ~= nil and n >= max - (buffer or 0)
+end
+
+-- The arrow runs 0 -> 1 -> 0 every 2 * Timing.Sweep seconds and Perfect is fill >= bestTier.Start
+-- (0.98), so the window is only a few ms either side of the peak. Waiting for the arrow to enter it
+-- fails on low FPS (a frame can skip the whole window), so this presses on the frame closest to the
+-- predicted peak, then reads the result and nudges the timing (throwLead) if it wasn't Perfect.
+local throwLead = 0      -- seconds to press before the predicted peak (auto-tuned, negative = later)
+local leadDir, missStreak = 1, 0
+local throwHits, throwMisses = 0, 0
+local dtAvg = 1 / 60
+local prevFill = nil
+
+local function reportThrow(gui)
+	task.delay(0.2, function()
+		if not alive then return end
+		local label = gui and gui:FindFirstChild(Timing.Flash, true)
+		if not (label and label:IsA("TextLabel")) then return end
+		local text = label.Text:upper()
+		if text == "" then return end
+
+		if bestTier.Text and text:find(bestTier.Text:upper(), 1, true) then
+			throwHits += 1
+			missStreak = 0
+		else
+			throwMisses += 1
+			missStreak += 1
+			if missStreak > 3 then -- this direction isn't helping, try the other one
+				leadDir = -leadDir
+				missStreak = 1
+			end
+			throwLead = math.clamp(throwLead + leadDir * 0.003, -0.02, 0.04)
+		end
+		setStatus(("Throw: %s (perfect %d/%d, lead %dms)"):format(
+			text, throwHits, throwHits + throwMisses, math.floor(throwLead * 1000 + 0.5)))
+	end)
+end
+
+local throwConn = RunService.RenderStepped:Connect(function(dt)
+	dtAvg = dtAvg * 0.9 + math.min(dt, 0.1) * 0.1
+
+	if not throwActive() or not ThrowCfg or not bestTier then
 		armed = false
+		prevFill = nil
 		return
 	end
 
 	local arrow, button = getTimingParts()
 	if not arrow then
-		-- Throw UI is hidden (throwing, cutscene, not carrying): reset
 		armed = false
+		prevFill = nil
 		return
 	end
 
-	if os.clock() - lastThrow < 0.5 then return end
+	if os.clock() - lastThrow < 0.5 then
+		prevFill = nil
+		return
+	end
 
 	local fill = arrow.Position.X.Scale
-	local tier = ThrowCfg.TimingTier(fill)
-	if not tier then return end
+	local last = prevFill
+	prevFill = fill
 
-	if tier.Name ~= bestTier.Name then
-		-- Arrow is somewhere below perfect, so this is a live reading. Arm.
-		armed = true
+	local tier = ThrowCfg.TimingTier(fill)
+	if tier and tier.Name ~= bestTier.Name then
+		armed = true -- a live reading below Perfect, so this is a fresh sweep
+	end
+	if not armed or not last then return end
+
+	local press
+	if fill > last then
+		-- rising: press when the next frame would overshoot the peak more than this one undershoots
+		local toPeak = (1 - fill) / (1 / Timing.Sweep)
+		press = fill >= 0.8 and toPeak <= dtAvg / 2 + throwLead
+	else
+		-- just past the peak: still inside the window
+		press = fill >= bestTier.Start
+	end
+	if not press then return end
+
+	if fishInventoryFull() then
+		if os.clock() - lastFullMsg > 3 then
+			lastFullMsg = os.clock()
+			setStatus("Fish inventory full: throwing paused")
+		end
 		return
 	end
 
-	-- Arrow is in the perfect tier. Only press if we saw it climb there this round.
-	if armed and pressButton(button) then
+	if pressButton(button) then
 		armed = false
+		prevFill = nil
 		lastThrow = os.clock()
-		setStatus("Perfect throw: " .. tier.Name)
+		reportThrow(button.Parent)
 	end
 end)
+table.insert(connections, throwConn)
 
 ---------------------------------------------------------------------
--- AUTO EQUIP HIGHEST BOMB (while Auto Throw is ON)
+-- BOMB HELPERS (ranking, stack counts) + AUTO EQUIP HIGHEST BOMB
 ---------------------------------------------------------------------
--- Rank = position in ITEM_NAMES (later = better). Matches tool names
--- ignoring case, spaces and underscores, so "Universe Reset Button x5" still matches.
-local function bombRank(toolName)
-	local lower = (toolName:lower():gsub("[%s_%-]", ""))
-	local best, bestLen = nil, 0
+local BombCfg
+pcall(function()
+	BombCfg = require(ReplicatedStorage:WaitForChild("Config", 5):WaitForChild("Bombs", 5))
+end)
+
+local MAX_HELD = (BombCfg and tonumber(BombCfg.MaxHeld)) or 50
+
+local function normName(s)
+	return (s:lower():gsub("[%s_%-]", ""))
+end
+
+-- Every known bomb (id + display name) -> rank (higher = better).
+-- Uses the game's own Config.Bombs when available, else the ITEM_NAMES list.
+local bombKeys = {}
+if BombCfg and type(BombCfg.All) == "table" then
+	for _, b in ipairs(BombCfg.All) do
+		local rank = (BombCfg.Rank and BombCfg.Rank(b.Id)) or 0
+		table.insert(bombKeys, { key = normName(b.Id), rank = rank })
+		if b.Name then
+			table.insert(bombKeys, { key = normName(b.Name), rank = rank })
+		end
+	end
+else
 	for i, n in ipairs(ITEM_NAMES) do
-		local key = n:lower()
-		-- "Shiny Plasma Bomb" -> "shinyplasmabomb" still contains "plasmabomb".
-		-- Longest match wins, so a mutation word can't be mistaken for another bomb.
-		if #key > bestLen and lower:find(key, 1, true) then
-			best, bestLen = i, #key
+		table.insert(bombKeys, { key = normName(n), rank = i })
+	end
+end
+
+-- Matches tool names ignoring case, spaces and underscores, so
+-- "Universe Reset Button x5" still matches. Longest match wins, so
+-- "Sea Mine" is never mistaken for "Mine" and a mutation word can't confuse it.
+local function bombRank(toolName)
+	local lower = normName(toolName)
+	local best, bestLen = nil, 0
+	for _, e in ipairs(bombKeys) do
+		if #e.key > bestLen and lower:find(e.key, 1, true) then
+			best, bestLen = e.rank, #e.key
 		end
 	end
 	return best
 end
 
-local function bestOwnedTool()
-	local char = player.Character
+-- Stack size of a bomb tool: "Count" attribute, then a Count value child,
+-- then an "x5" in the name, else 1.
+local function toolCount(tool)
+	local attr = tool:GetAttribute("Count")
+	if type(attr) == "number" then return attr end
+	local child = tool:FindFirstChild("Count")
+	if child and child:IsA("ValueBase") then
+		local n = tonumber(child.Value)
+		if n then return n end
+	end
+	local n = tonumber(tool.Name:match("[xX]%s*(%d+)") or tool.Name:match("(%d+)%s*[xX]"))
+	return n or 1
+end
+
+-- the game tags bomb tools with BombId (fish tools have ItemKey but no BombId)
+local function toolBombRank(tool)
+	local id = tool:GetAttribute("BombId")
+	if id then
+		local b = BombCfg and BombCfg.ById and BombCfg.ById[id]
+		if b then
+			return b.Tier * 1000 + ((BombCfg.Rank and BombCfg.Rank(id)) or 0)
+		end
+	elseif tool:GetAttribute("ItemKey") then
+		return nil -- a fish
+	end
+	return bombRank(tool.Name)
+end
+
+local function ownedContainers()
+	local list = {}
+	if player.Character then table.insert(list, player.Character) end
 	local backpack = player:FindFirstChildOfClass("Backpack")
+	if backpack then table.insert(list, backpack) end
+	return list
+end
+
+local function heldBombs()
+	if DataCtl then
+		local ok, bombs = pcall(DataCtl.Get, "Bombs")
+		if ok and type(bombs) == "table" then
+			local sum = 0
+			for _, b in pairs(bombs) do
+				sum += tonumber(b.Count) or 1
+			end
+			return sum
+		end
+	end
+	local total = 0
+	for _, container in ipairs(ownedContainers()) do
+		for _, tool in ipairs(container:GetChildren()) do
+			if tool:IsA("Tool") and toolBombRank(tool) ~= nil then
+				total += toolCount(tool)
+			end
+		end
+	end
+	return total
+end
+
+local function bestOwnedTool()
 	local bestTool, bestRank
-	for _, container in ipairs({ char, backpack }) do
-		if container then
-			for _, tool in ipairs(container:GetChildren()) do
-				if tool:IsA("Tool") then
-					local r = bombRank(tool.Name)
-					if r and (not bestRank or r > bestRank) then
-						bestTool, bestRank = tool, r
-					end
+	for _, container in ipairs(ownedContainers()) do
+		for _, tool in ipairs(container:GetChildren()) do
+			if tool:IsA("Tool") then
+				local r = toolBombRank(tool)
+				if r and (not bestRank or r > bestRank) then
+					bestTool, bestRank = tool, r
 				end
 			end
 		end
@@ -592,10 +882,10 @@ local function bestOwnedTool()
 end
 
 task.spawn(function()
-	while true do
+	while alive do
 		task.wait(0.5)
 		-- skip during throw cutscenes (the game shows a "Letterbox" gui then)
-		if autoThrow and ThrowCfg
+		if throwActive() and ThrowCfg
 			and not playerGui:FindFirstChild("Letterbox")
 			and os.clock() - lastThrow > 2 then
 			pcall(function()
@@ -614,254 +904,396 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------------
--- UI (always on top)
+-- AUTO FARM
+-- roll phase : roll + buy selected bombs + collect cash
+-- (50 bombs) : pause both, walk to the Lookout throw spot
+-- throw phase: equip best bomb + perfect throws until 0 bombs, then back to roll
+-- fish nearly full (5 slots before max): equip best fish in the tank first (safety check), then sell the rest
+--              (favorites and anything that could still go in the tank are kept)
 ---------------------------------------------------------------------
-local FULL_SIZE = UDim2.fromOffset(240, 230)
-local MINI_SIZE = UDim2.fromOffset(240, 28)
-
-local gui = Instance.new("ScreenGui")
-gui.Name = "AutoRollGui"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.DisplayOrder = 999999
-gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
-
--- CoreGui / gethui render above every PlayerGui, so nothing in the game can cover it
-local parented = false
-if gethui then
-	parented = pcall(function() gui.Parent = gethui() end) and gui.Parent ~= nil
-end
-if not parented then
-	parented = pcall(function() gui.Parent = game:GetService("CoreGui") end) and gui.Parent ~= nil
-end
-if not parented then
-	gui.Parent = playerGui
-end
-
-local frame = Instance.new("Frame")
-frame.Size = FULL_SIZE
-frame.Position = UDim2.new(0, 20, 0.5, -115)
-frame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-frame.BorderSizePixel = 0
-frame.Active = true
-frame.Draggable = true
-frame.Parent = gui
-Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
-
-local body = Instance.new("Frame")
-body.Name = "Body"
-body.Size = UDim2.fromScale(1, 1)
-body.BackgroundTransparency = 1
-body.Parent = frame
-
-local function makeLabel(text, y, h, size, font, color)
-	local l = Instance.new("TextLabel")
-	l.Size = UDim2.new(1, -20, 0, h)
-	l.Position = UDim2.fromOffset(10, y)
-	l.BackgroundTransparency = 1
-	l.Text = text
-	l.TextColor3 = color or Color3.new(1, 1, 1)
-	l.Font = font
-	l.TextSize = size
-	l.Parent = body
-	return l
-end
-
-local function makeButton(text, y, color)
-	local b = Instance.new("TextButton")
-	b.Size = UDim2.new(1, -20, 0, 30)
-	b.Position = UDim2.fromOffset(10, y)
-	b.BackgroundColor3 = color
-	b.TextColor3 = Color3.new(1, 1, 1)
-	b.Font = Enum.Font.GothamBold
-	b.TextSize = 14
-	b.Text = text
-	b.Parent = body
-	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
-	return b
-end
-
-local RED, GREEN = Color3.fromRGB(180, 60, 60), Color3.fromRGB(60, 160, 80)
-
--- Title bar + minimize button (these stay visible when minimized)
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -36, 0, 28)
-title.Position = UDim2.fromOffset(10, 0)
-title.BackgroundTransparency = 1
-title.Text = "Auto Roll"
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextColor3 = Color3.new(1, 1, 1)
-title.Font = Enum.Font.GothamBold
-title.TextSize = 14
-title.Parent = frame
-
-local minBtn = Instance.new("TextButton")
-minBtn.Size = UDim2.fromOffset(24, 20)
-minBtn.Position = UDim2.new(1, -30, 0, 4)
-minBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 58)
-minBtn.TextColor3 = Color3.new(1, 1, 1)
-minBtn.Font = Enum.Font.GothamBold
-minBtn.TextSize = 16
-minBtn.Text = "–"
-minBtn.Parent = frame
-Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 5)
-
-local dropBtn = makeButton("Select items  ▼", 34, Color3.fromRGB(50, 50, 58))
-dropBtn.Font = Enum.Font.Gotham
-
-local toggleBtn = makeButton("Auto Roll: OFF", 72, RED)
-local throwBtn = makeButton("Auto Throw: OFF", 110, RED)
-local collectBtn = makeButton("Auto Collect: OFF", 148, RED)
-
-status = makeLabel("Idle", 186, 36, 12, Enum.Font.Gotham, Color3.fromRGB(200, 200, 200))
-status.TextWrapped = true
-
--- Multi-select dropdown list
-local list = Instance.new("ScrollingFrame")
-list.Size = UDim2.new(1, -20, 0, 150)
-list.Position = UDim2.fromOffset(10, 66)
-list.BackgroundColor3 = Color3.fromRGB(45, 45, 52)
-list.BorderSizePixel = 0
-list.ScrollBarThickness = 4
-list.Visible = false
-list.ZIndex = 5
-list.CanvasSize = UDim2.new(0, 0, 0, #ITEM_NAMES * 26)
-list.Parent = body
-
-Instance.new("UIListLayout", list).SortOrder = Enum.SortOrder.LayoutOrder
-
-local function updateDropText()
-	local count = 0
-	for _ in pairs(selected) do count += 1 end
-	dropBtn.Text = (count == 0 and "Select items" or (count .. " selected")) .. "  ▼"
-end
-
-local function styleOption(opt, name)
-	if selected[name] then
-		opt.Text = "☑  " .. name
-		opt.TextColor3 = Color3.fromRGB(90, 220, 120)
-	else
-		opt.Text = "☐  " .. name
-		opt.TextColor3 = Color3.new(1, 1, 1)
+local FishCfg, InvCfg, TankCfg
+do
+	local cfg = ReplicatedStorage:FindFirstChild("Config") or ReplicatedStorage:WaitForChild("Config", 5)
+	if cfg then
+		pcall(function() FishCfg = require(cfg:WaitForChild("Fish", 5)) end)
+		pcall(function() InvCfg = require(cfg:WaitForChild("Inventory", 5)) end)
+		pcall(function() TankCfg = require(cfg:WaitForChild("Tank", 5)) end)
 	end
 end
 
-for i, name in ipairs(ITEM_NAMES) do
-	local opt = Instance.new("TextButton")
-	opt.Size = UDim2.new(1, 0, 0, 26)
-	opt.LayoutOrder = i
-	opt.BackgroundTransparency = 1
-	opt.Font = Enum.Font.Gotham
-	opt.TextSize = 13
-	opt.TextXAlignment = Enum.TextXAlignment.Left
-	opt.ZIndex = 6
-	opt.Parent = list
-	styleOption(opt, name)
+local onFarmChanged = nil -- set by the UI so it can refresh toggle locks
+local function farmChanged()
+	recomputeRunning()
+	if onFarmChanged then onFarmChanged() end
+end
 
-	opt.MouseButton1Click:Connect(function()
-		selected[name] = (not selected[name]) or nil
-		styleOption(opt, name)
-		updateDropText()
-		saveSettings()
+local function getRoot()
+	local char = player.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function flatDistance(a, b)
+	return Vector3.new(a.X - b.X, 0, a.Z - b.Z).Magnitude
+end
+
+-- walks to a point on the XZ plane; returns true when within tol
+local function walkFlat(target, tol, timeout)
+	local char = player.Character
+	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and root) then return false end
+
+	local step = newMover()
+	local deadline = os.clock() + timeout
+	while autoFarm and os.clock() < deadline and humanoid.Health > 0 and root.Parent
+		and flatDistance(root.Position, target) > tol do
+		step(humanoid, root, Vector3.new(target.X, root.Position.Y, target.Z))
+		task.wait(0.1)
+	end
+	humanoid:MoveTo(root.Position)
+	task.wait(0.1)
+	return root.Parent ~= nil and flatDistance(root.Position, target) <= tol + 2
+end
+
+-- centre of the nearest Island's Lookout > 23262B part
+local function findLookoutSpot()
+	local map = Workspace:FindFirstChild("Map")
+	local islands = map and map:FindFirstChild("Islands")
+	local root = getRoot()
+	if not (islands and root) then return nil end
+
+	local bestPos, bestDist
+	for _, island in ipairs(islands:GetChildren()) do
+		local lookout = island:FindFirstChild("Lookout")
+		local part = lookout and lookout:FindFirstChild("23262B", true)
+		local pos = part and getPosition(part)
+		if pos then
+			local d = flatDistance(pos, root.Position)
+			if not bestDist or d < bestDist then
+				bestPos, bestDist = pos, d
+			end
+		end
+	end
+	return bestPos
+end
+
+-- the game's own check: is this position inside a throw deck?
+local function inThrowZone()
+	local root = getRoot()
+	if not root then return false end
+	if BombCfg and BombCfg.NearestDeck and BombCfg.DeckDistance then
+		local ok, dist = pcall(function()
+			return BombCfg.DeckDistance(root.Position, BombCfg.NearestDeck(root.Position))
+		end)
+		if ok and type(dist) == "number" then
+			return dist <= 0.01
+		end
+	end
+	return true -- no config to check against; trust the lookout position
+end
+
+local farmSpot = nil -- where we decided to stand for throwing
+
+local function goToThrowSpot()
+	local spot = findLookoutSpot()
+	if spot then
+		walkFlat(spot, FARM_SPOT_TOL, 45)
+		farmSpot = spot
+	end
+
+	-- if the lookout centre is outside the game's throw zone, aim for the middle of the zone instead
+	if not inThrowZone() and BombCfg and BombCfg.NearestDeck then
+		local root = getRoot()
+		if root then
+			local deck = BombCfg.NearestDeck(root.Position)
+			local mid = ((BombCfg.ThrowZoneFrom or 0) + (BombCfg.DeckHalfLength or 12)) / 2
+			local target = deck.Center + deck.Out * mid
+			walkFlat(target, 3, 25)
+			farmSpot = target
+		end
+	end
+
+	local root = getRoot()
+	return farmSpot ~= nil and root ~= nil and flatDistance(root.Position, farmSpot) <= FARM_SPOT_TOL + 3
+end
+
+-- fish the tank would be better off with are never sold
+local function isFavoriteFish(inv, id)
+	if not InvCfg then return true end -- can't check: treat as protected
+	local fav = type(inv) == "table" and inv.Favorites
+	return type(fav) == "table" and fav[InvCfg.FishKey(id)] == true
+end
+
+local function planSales()
+	if not (DataCtl and FishCfg and InvCfg and TankCfg and TankCfg.Income) then return nil end
+	local okI, inv = pcall(DataCtl.Get, "Inventory")
+	local okT, tank = pcall(DataCtl.Get, "Tank")
+	if not (okI and okT and type(inv) == "table" and type(tank) == "table") then return nil end
+
+	local tankFish = type(tank.Fish) == "table" and tank.Fish or {}
+	local free = math.max((tonumber(tank.Capacity) or #tankFish) - #tankFish, 0)
+
+	local weakest = math.huge
+	for _, f in ipairs(tankFish) do
+		local ok, inc = pcall(TankCfg.Income, f.Species, f.Weight, f.Mutation, tankFish)
+		if ok and type(inc) == "number" and inc < weakest then
+			weakest = inc
+		end
+	end
+
+	local cands = {}
+	for _, f in ipairs(type(inv.Fish) == "table" and inv.Fish or {}) do
+		if FishCfg.ById[f.Species] and not isFavoriteFish(inv, f.Id) then
+			local ok, inc = pcall(TankCfg.Income, f.Species, f.Weight, f.Mutation, tankFish)
+			-- unknown income counts as "very good" so it is kept
+			table.insert(cands, {
+				id = f.Id,
+				income = (ok and type(inc) == "number") and inc or math.huge,
+			})
+		end
+	end
+
+	table.sort(cands, function(a, b)
+		if a.income ~= b.income then return a.income > b.income end
+		return tostring(a.id) < tostring(b.id)
 	end)
+
+	local sell, kept = {}, 0
+	for i, c in ipairs(cands) do
+		-- keep what fills free tank slots, and anything stronger than the weakest tank fish
+		local keep = i <= free or c.income > weakest
+		if keep then
+			kept += 1
+		else
+			table.insert(sell, c.id)
+		end
+	end
+	return sell, kept
 end
-updateDropText()
 
-dropBtn.MouseButton1Click:Connect(function()
-	list.Visible = not list.Visible
-end)
-
--- Minimize
-local minimized = false
-minBtn.MouseButton1Click:Connect(function()
-	minimized = not minimized
-	list.Visible = false
-	body.Visible = not minimized
-	frame.Size = minimized and MINI_SIZE or FULL_SIZE
-	minBtn.Text = minimized and "+" or "–"
-end)
-
-local refreshCollectBtn -- defined below; the throw button needs to update it
-local refreshRollBtn     -- same for the roll button
-
--- Auto throw button
-local function refreshThrowBtn()
-	throwBtn.Text = autoThrow and "Auto Throw: ON" or "Auto Throw: OFF"
-	throwBtn.BackgroundColor3 = autoThrow and GREEN or RED
+local UpgradesCfg
+do
+	local cfg = ReplicatedStorage:FindFirstChild("Config")
+	if cfg then
+		pcall(function() UpgradesCfg = require(cfg:WaitForChild("Upgrades", 5)) end)
+	end
 end
-refreshThrowBtn()
 
-throwBtn.MouseButton1Click:Connect(function()
-	if not ThrowCfg then
-		setStatus("Throw config not found")
+-- the zone part inside a shop (name from Config.Upgrades.Shops.ZoneName, else any part with "zone" in its name)
+local function shopZonePart(shop)
+	local name = UpgradesCfg and UpgradesCfg.Shops and UpgradesCfg.Shops.ZoneName
+	local z = name and shop:FindFirstChild(name, true)
+	if z and z:IsA("BasePart") then return z end
+	for _, d in ipairs(shop:GetDescendants()) do
+		if d:IsA("BasePart") and d.Name:lower():find("zone") then
+			return d
+		end
+	end
+	return nil
+end
+
+-- nearest fish market: Workspace.Map.Shops.FishMarket1..6 (or any shop with Kind == "Sell").
+-- Returns the position to stand at and how close counts as "there".
+local function findSellSpot()
+	local map = Workspace:FindFirstChild("Map")
+	local folder = map and (map:FindFirstChild("Shops")
+		or (UpgradesCfg and UpgradesCfg.Shops and map:FindFirstChild(UpgradesCfg.Shops.FolderPath)))
+	local root = getRoot()
+	if not (folder and root) then return nil end
+
+	local bestPos, bestTol, bestDist
+	for _, shop in ipairs(folder:GetChildren()) do
+		if shop.Name:match("^FishMarket%d+$") or shop:GetAttribute("Kind") == "Sell" then
+			local zone = shopZonePart(shop)
+			local pos = zone and zone.Position or getPosition(shop)
+			if pos then
+				local tol = zone and math.clamp(math.min(zone.Size.X, zone.Size.Z) / 4, 2, 6) or 6
+				local d = flatDistance(pos, root.Position)
+				if not bestDist or d < bestDist then
+					bestPos, bestTol, bestDist = pos, tol, d
+				end
+			end
+		end
+	end
+	return bestPos, bestTol
+end
+
+local function sendSells(ids)
+	local sellRemote = Remotes.get("SellFish")
+	local sold = 0
+	for _, id in ipairs(ids) do
+		if not autoFarm then break end
+		sellRemote:FireServer(id)
+		sold += 1
+		task.wait(0.15)
+	end
+	return sold
+end
+
+-- the server may only accept sales while you stand in the shop zone
+local function sellAtShop()
+	local spot, tol = findSellSpot()
+	if not spot then
+		setStatus("Farm: sell shop not found")
+		warn("[VintHub] sell shop not found (Workspace.Map.Shops.FishMarketN)")
 		return
 	end
-	autoThrow = not autoThrow
-	armed = false
-	if not autoThrow then
-		lastCollect = 0 -- if Auto Collect was on before, it resumes right away
-	end
-	refreshThrowBtn()
-	refreshCollectBtn()
-	refreshRollBtn()
-	saveSettings()
-	list.Visible = false
-end)
 
--- Auto collect button
-function refreshCollectBtn()
-	if autoThrow then
-		-- locked while Auto Throw is on; "PAUSED" means it was ON and will resume
-		collectBtn.Text = autoCollect and "Collect: PAUSED" or "Collect: LOCKED"
-		collectBtn.BackgroundColor3 = Color3.fromRGB(90, 90, 95)
-	else
-		collectBtn.Text = autoCollect and "Auto Collect: ON" or "Auto Collect: OFF"
-		collectBtn.BackgroundColor3 = autoCollect and GREEN or RED
-	end
-end
-refreshCollectBtn()
-
-collectBtn.MouseButton1Click:Connect(function()
-	if autoThrow then
-		setStatus("Turn off Auto Throw to use Auto Collect")
+	setStatus("Farm: walking to the fish market")
+	if not walkFlat(spot, tol, 45) then
+		setStatus("Farm: couldn't reach the sell shop")
 		return
 	end
-	autoCollect = not autoCollect
-	lastCollect = 0 -- collect right away when turned on
-	refreshCollectBtn()
-	saveSettings()
-	list.Visible = false
+	task.wait(0.6) -- let the server see us inside the zone
+
+	local ids = planSales()
+	if not ids or #ids == 0 then return end
+	local before = fishCount() or #ids
+	local sold = sendSells(ids)
+	task.wait(1)
+	local after = fishCount() or before
+	setStatus(("Farm: sold at the shop (%d sent, %d -> %d fish)"):format(sold, before, after))
+end
+
+local remoteSellWorks = nil -- nil = not tried yet, then true/false
+
+local function farmSellCycle()
+	if not Remotes then return end
+	local tankRemote = Remotes.get("Tank")
+
+	-- safety check: equip the best fish first. If something that belongs in the
+	-- tank is still in the inventory afterwards, try once more.
+	local ids, kept
+	for _ = 1, 2 do
+		tankRemote:FireServer("EquipBest")
+		task.wait(1.2) -- let the server move the fish and the client data update
+		ids, kept = planSales()
+		if not ids or kept == 0 then break end
+	end
+
+	if not ids then
+		setStatus("Farm: couldn't read inventory")
+		return
+	end
+	if #ids == 0 then
+		setStatus("Farm: inventory nearly full but nothing sellable (favorites/tank fish only)")
+		return
+	end
+
+	-- 1) try selling from wherever we are
+	if remoteSellWorks ~= false then
+		local before = fishCount() or #ids
+		local sold = sendSells(ids)
+		task.wait(1)
+		local after = fishCount() or before
+		if after < before then
+			remoteSellWorks = true
+			setStatus(("Farm: sold %d fish remotely (%d -> %d)"):format(sold, before, after))
+			return
+		end
+		remoteSellWorks = false
+		print("[VintHub] remote sell had no effect, selling at the shop instead")
+	end
+
+	-- 2) walk into the sell shop and sell there
+	-- (in the throw phase the loop walks us back to the lookout afterwards)
+	lock()
+	local ok, err = pcall(sellAtShop)
+	unlock()
+	if not ok then
+		warn("[VintHub] shop sell error: " .. tostring(err))
+	end
+end
+
+-- no timer: it only runs when the fish inventory is within FISH_SELL_BUFFER slots of max
+local lastSell = 0
+local lastReadWarn = 0
+task.spawn(function()
+	while alive do
+		task.wait(0.5)
+		if autoFarm and os.clock() - lastSell >= 10 then
+			local n, max = fishCount()
+			if not n or not max then
+				if os.clock() - lastReadWarn > 30 then
+					lastReadWarn = os.clock()
+					warn("[VintHub] can't read the fish inventory (DataController / Inventory.MaxFish)")
+					setStatus("Farm: can't read fish inventory")
+				end
+			elseif n >= max - FISH_SELL_BUFFER then
+				local msg = ("Farm: fish %d/%d, equip best + sell"):format(n, max)
+				print("[VintHub] " .. msg)
+				setStatus(msg)
+				local ok, err = pcall(farmSellCycle)
+				if not ok then
+					warn("[VintHub] sell cycle error: " .. tostring(err))
+				end
+				lastSell = os.clock() -- also the retry cooldown if nothing could be sold
+			end
+		end
+	end
+end)
+
+local function enterThrowPhase()
+	lock() -- waits for any roll/collect step to finish
+	if autoFarm and farmPhase == "roll" then
+		farmPhase = "throw"
+		farmSpot = nil
+		farmChanged()
+		setStatus("Farm: " .. MAX_HELD .. " bombs, heading to the lookout")
+		pcall(goToThrowSpot)
+		if not (farmSpot and getRoot() and flatDistance(getRoot().Position, farmSpot) <= FARM_SPOT_TOL + 3) then
+			setStatus("Farm: couldn't reach the throw spot, retrying")
+		end
+	end
+	unlock()
+end
+
+task.spawn(function()
+	local zeroChecks = 0
+	while alive do
+		task.wait(0.5)
+
+		if not autoFarm then
+			if farmPhase ~= "roll" then
+				farmPhase = "roll"
+				farmChanged()
+			end
+			zeroChecks = 0
+		elseif farmPhase == "roll" then
+			zeroChecks = 0
+			if heldBombs() >= MAX_HELD then
+				enterThrowPhase()
+			end
+		else
+			local held = heldBombs()
+			if held <= 0 then zeroChecks += 1 else zeroChecks = 0 end
+
+			if zeroChecks >= 4 and os.clock() - lastThrow > 2 then
+				-- out of bombs: back to rolling + collecting, and sell what the throws gave us
+				zeroChecks = 0
+				farmPhase = "roll"
+				lastCollect = 0
+				lastSell = 0
+				farmChanged()
+				setStatus("Farm: out of bombs, back to rolling")
+			else
+				local root = getRoot()
+				local away = root and (not farmSpot or flatDistance(root.Position, farmSpot) > FARM_SPOT_TOL + 6)
+				if held > 0 and away then
+					lock()
+					if autoFarm and farmPhase == "throw" then
+						pcall(goToThrowSpot)
+					end
+					unlock()
+				end
+			end
+		end
+	end
 end)
 
 ---------------------------------------------------------------------
--- MAIN LOOP (auto roll / buy)
+-- ROLL LOOP (auto roll / buy)
 ---------------------------------------------------------------------
-function refreshRollBtn()
-	running = rollWanted and not autoThrow
-	if autoThrow then
-		-- locked while Auto Throw is on; "PAUSED" means it was ON and will resume
-		toggleBtn.Text = rollWanted and "Roll: PAUSED" or "Roll: LOCKED"
-		toggleBtn.BackgroundColor3 = Color3.fromRGB(90, 90, 95)
-	else
-		toggleBtn.Text = rollWanted and "Auto Roll: ON" or "Auto Roll: OFF"
-		toggleBtn.BackgroundColor3 = rollWanted and GREEN or RED
-	end
-end
-refreshRollBtn()
-
-toggleBtn.MouseButton1Click:Connect(function()
-	if autoThrow then
-		setStatus("Turn off Auto Throw to use Auto Roll")
-		return
-	end
-	rollWanted = not rollWanted
-	refreshRollBtn()
-	setStatus(running and "Running..." or "Idle")
-	list.Visible = false
-end)
-
 local function rollIteration()
 	local result, name = tryBuy()
 	if result == "bought" then
@@ -891,19 +1323,280 @@ local function rollIteration()
 end
 
 task.spawn(function()
-	while true do
+	while alive do
 		if running then
 			if next(selected) == nil then
-				setStatus("Select at least one item")
+				setStatus("Select at least one bomb")
 				task.wait(0.5)
 			else
 				lock()
-				pcall(rollIteration)
+				if running then -- may have changed while waiting for the lock
+					pcall(rollIteration)
+				end
 				unlock()
-				task.wait(ROLL_DELAY) -- lock is free here so collecting can slot in
+				task.wait(ROLL_DELAY)
 			end
 		else
 			task.wait(0.25)
 		end
 	end
 end)
+
+---------------------------------------------------------------------
+-- UI (WindUI)
+---------------------------------------------------------------------
+local WINDUI_URL = "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
+
+local okLoad, WindUI = pcall(function()
+	return loadstring(game:HttpGet(WINDUI_URL))()
+end)
+if not okLoad or type(WindUI) ~= "table" then
+	warn("[VintHub] couldn't load WindUI: " .. tostring(WindUI))
+	return
+end
+
+-- game name for the window title
+local gameName = game.Name
+pcall(function()
+	local info = MarketplaceService:GetProductInfo(game.PlaceId)
+	if info and info.Name and info.Name ~= "" then
+		gameName = info.Name
+	end
+end)
+
+-- blue gradient theme: tries gradients first, then a solid blue theme, then plain Dark
+local function registerTheme()
+	local function hex(h) return Color3.fromHex(h) end
+	local base = {
+		Name = "VintBlue",
+		Accent = hex("#2563eb"),
+		Dialog = hex("#0b1530"),
+		Outline = hex("#3b82f6"),
+		Text = hex("#e8f1ff"),
+		Placeholder = hex("#7f93b8"),
+		Background = hex("#0a1228"),
+		Button = hex("#1e3a8a"),
+		Icon = hex("#93c5fd"),
+	}
+
+	local okGradient = pcall(function()
+		local theme = table.clone(base)
+		theme.Accent = WindUI:Gradient({
+			["0"] = { Color = hex("#1d4ed8"), Transparency = 0 },
+			["100"] = { Color = hex("#38bdf8"), Transparency = 0 },
+		}, { Rotation = 45 })
+		theme.Background = WindUI:Gradient({
+			["0"] = { Color = hex("#050b1f"), Transparency = 0 },
+			["100"] = { Color = hex("#0f2a5c"), Transparency = 0 },
+		}, { Rotation = 45 })
+		WindUI:AddTheme(theme)
+	end)
+	if okGradient then return "VintBlue" end
+
+	local okSolid = pcall(function() WindUI:AddTheme(base) end)
+	return okSolid and "VintBlue" or "Dark"
+end
+
+local themeName = registerTheme()
+
+-- callbacks are ignored while the UI is being built, so a startup callback
+-- can't wipe the settings that were loaded from disk
+local building = true
+
+local Window = WindUI:CreateWindow({
+	Title = "VintHub | " .. gameName,
+	Icon = "star",
+	Theme = themeName,
+	Folder = "VintHub",
+	ToggleKey = Enum.KeyCode.RightShift,
+})
+
+pcall(function() WindUI:SetTheme(themeName) end)
+table.insert(extras, function() Window:Destroy() end)
+
+pcall(function()
+	Window:EditOpenButton({
+		Title = "VintHub",
+		Icon = "star",
+		Enabled = true,
+		OnlyMobile = false,
+		Draggable = true,
+	})
+end)
+
+local Tab = Window:Tab({ Title = "Main", Icon = "home" })
+
+local rollToggle, collectToggle, throwToggle, spinToggle, farmToggle
+
+local function setLocked(element, locked)
+	pcall(function()
+		if not element then return end
+		if locked and element.Lock then
+			element:Lock()
+		elseif not locked and element.Unlock then
+			element:Unlock()
+		end
+	end)
+end
+
+-- Auto Throw suspends Auto Roll / Auto Collect (their on/off choice is remembered).
+-- Auto Farm owns roll, collect and throw while it runs.
+local function applyModes()
+	recomputeRunning()
+	setLocked(rollToggle, autoThrow or autoFarm)
+	setLocked(collectToggle, autoThrow or autoFarm)
+	setLocked(throwToggle, autoFarm)
+	setLocked(farmToggle, autoThrow)
+end
+onFarmChanged = applyModes
+
+local function notify(title, content)
+	pcall(function()
+		WindUI:Notify({ Title = title, Content = content, Duration = 4 })
+	end)
+end
+
+local function selectedList()
+	local arr = {}
+	for _, n in ipairs(ITEM_NAMES) do
+		if selected[n] then table.insert(arr, n) end
+	end
+	return arr
+end
+
+Tab:Dropdown({
+	Title = "Bombs to buy",
+	Desc = "Buys any selected bomb that shows up in the offers",
+	Values = ITEM_NAMES,
+	Value = selectedList(),
+	Multi = true,
+	AllowNone = true,
+	Callback = function(chosen)
+		if building then return end
+		table.clear(selected)
+		if type(chosen) == "table" then
+			for k, v in pairs(chosen) do
+				if type(v) == "string" then
+					selected[v] = true
+				elseif v == true and type(k) == "string" then
+					selected[k] = true
+				end
+			end
+		elseif type(chosen) == "string" then
+			selected[chosen] = true
+		end
+		saveSettings()
+	end,
+})
+
+farmToggle = Tab:Toggle({
+	Title = "Auto Farm",
+	Desc = "Rolls + collects until " .. MAX_HELD .. " bombs, then throws them at the lookout. When the fish inventory is " .. FISH_SELL_BUFFER .. " slots from full it equips the best fish, then sells the rest",
+	Value = autoFarm,
+	Callback = function(state)
+		if building then return end
+		if state and (autoThrow or not ThrowCfg) then
+			autoFarm = false
+			pcall(function() farmToggle:Set(false) end)
+			notify("Auto Farm", autoThrow and "Turn off Auto Throw first" or "Couldn't load the throw config")
+			return
+		end
+		autoFarm = state
+		farmPhase = "roll"
+		farmSpot = nil
+		lastCollect = 0
+		lastSell = 0
+		applyModes()
+		saveSettings()
+		setStatus(state and "Auto Farm on" or "Auto Farm off")
+	end,
+})
+
+rollToggle = Tab:Toggle({
+	Title = "Auto Roll",
+	Desc = "Pulls the lever and buys the selected bombs (walks to them)",
+	Value = false,
+	Callback = function(state)
+		if building then return end
+		rollWanted = state
+		applyModes()
+		if (autoThrow or autoFarm) and state then
+			setStatus("Roll will start when Auto Throw / Auto Farm is off")
+		else
+			setStatus(running and "Running..." or "Idle")
+		end
+	end,
+})
+
+throwToggle = Tab:Toggle({
+	Title = "Auto Throw",
+	Desc = "Equips your best bomb and throws on a perfect timing",
+	Value = autoThrow,
+	Callback = function(state)
+		if building then return end
+		if state and not ThrowCfg then
+			autoThrow = false
+			pcall(function() throwToggle:Set(false) end)
+			notify("Auto Throw", "Couldn't load the throw config")
+			return
+		end
+		autoThrow = state
+		armed = false
+		if not autoThrow then
+			lastCollect = 0
+		end
+		applyModes()
+		saveSettings()
+		setStatus(autoThrow and "Auto Throw on: roll/collect paused" or "Auto Throw off")
+	end,
+})
+
+collectToggle = Tab:Toggle({
+	Title = "Auto Collect",
+	Desc = "Walks to your collect pad every " .. COLLECT_INTERVAL .. "s",
+	Value = autoCollect,
+	Callback = function(state)
+		if building then return end
+		autoCollect = state
+		lastCollect = 0
+		saveSettings()
+		if autoThrow and state then
+			setStatus("Collect will resume when Auto Throw is off")
+		end
+	end,
+})
+
+spinToggle = Tab:Toggle({
+	Title = "Auto Spin Wheel",
+	Desc = "Spins the wheel and skips the animation (no walking)",
+	Value = autoSpin,
+	Callback = function(state)
+		if building then return end
+		if state and not Remotes then
+			autoSpin = false
+			pcall(function() spinToggle:Set(false) end)
+			notify("Auto Spin", "Couldn't find the wheel remotes")
+			return
+		end
+		autoSpin = state
+		saveSettings()
+	end,
+})
+
+local statusPara = Tab:Paragraph({
+	Title = "Status",
+	Desc = "Idle",
+})
+
+statusSetter = function(text)
+	pcall(function() statusPara:SetDesc(text) end)
+end
+
+applyModes()
+
+-- open on the Main tab
+pcall(function() Tab:Select() end)
+pcall(function() Window:SelectTab(1) end)
+
+building = false
+notify("VintHub", "Loaded")
