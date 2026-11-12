@@ -97,6 +97,7 @@ local selected = {}   -- [name] = true
 local autoThrow = false
 local autoCollect = false
 local autoSpin = false
+local autoStay = true -- claim the stay reward whenever it's available (on by default)
 local autoFarm = false
 local farmPhase = "roll" -- "roll" (roll + collect) or "throw" (walk to lookout + throw)
 local statusSetter = nil -- set after the UI is built
@@ -125,6 +126,7 @@ local function loadSettings()
 		autoCollect = data.autoCollect == true
 		autoSpin = data.autoSpin == true
 		autoFarm = data.autoFarm == true
+		autoStay = data.autoStay ~= false
 	end
 end
 
@@ -139,6 +141,7 @@ local function saveSettings()
 			autoCollect = autoCollect,
 			autoSpin = autoSpin,
 			autoFarm = autoFarm,
+			autoStay = autoStay,
 		}))
 	end)
 end
@@ -600,6 +603,44 @@ task.spawn(function()
 			end
 		else
 			task.wait(0.5)
+		end
+	end
+end)
+
+---------------------------------------------------------------------
+-- AUTO CLAIM STAY REWARD (same readiness check as the game's StayRewardController)
+---------------------------------------------------------------------
+local StayCfg, TutorialCfg
+do
+	local cfg = ReplicatedStorage:FindFirstChild("Config") or ReplicatedStorage:WaitForChild("Config", 5)
+	if cfg then
+		pcall(function() StayCfg = require(cfg:WaitForChild("StayReward", 5)) end)
+		pcall(function() TutorialCfg = require(cfg:WaitForChild("Tutorial", 5)) end)
+	end
+end
+
+local function stayReady()
+	if not (DataCtl and StayCfg) then return false end
+	local okAll, all = pcall(DataCtl.Get)
+	if not (okAll and all) then return false end -- data not loaded yet
+
+	local okT, tut = pcall(DataCtl.Get, "Tutorial")
+	if okT and TutorialCfg and TutorialCfg.Active(tut) then return false end
+
+	local okS, stay = pcall(DataCtl.Get, "StayReward")
+	local last = okS and type(stay) == "table" and stay.Last or nil
+	local okL, left = pcall(StayCfg.Left, last, Workspace:GetServerTimeNow())
+	return okL and type(left) == "number" and left <= 0
+end
+
+task.spawn(function()
+	local lastClaim = 0
+	while alive do
+		task.wait(5)
+		if autoStay and Remotes and os.clock() - lastClaim >= 10 and stayReady() then
+			lastClaim = os.clock()
+			pcall(function() Remotes.get("ClaimStay"):FireServer() end)
+			setStatus("Claimed stay reward")
 		end
 	end
 end)
@@ -1579,6 +1620,17 @@ spinToggle = Tab:Toggle({
 			return
 		end
 		autoSpin = state
+		saveSettings()
+	end,
+})
+
+Tab:Toggle({
+	Title = "Auto Claim Stay Reward",
+	Desc = "Claims the stay reward whenever it's available",
+	Value = autoStay,
+	Callback = function(state)
+		if building then return end
+		autoStay = state
 		saveSettings()
 	end,
 })
