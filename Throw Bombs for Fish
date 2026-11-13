@@ -21,6 +21,7 @@ if type(env.VintHubCleanup) == "function" then
 end
 
 local alive = true
+local session = { start = os.clock(), found = 0, sold = 0, thrown = 0 }
 local connections, extras = {}, {}
 local function track(conn)
 	table.insert(connections, conn)
@@ -82,6 +83,42 @@ local ITEM_NAMES = {
 	"QuasarBlast", "BigBangBomb", "UniverseResetButton",
 }
 
+-- Every bomb in ReplicatedStorage > Assets > Bombs (new bombs show up on their own), cheapest first.
+local BombCfg
+pcall(function()
+	BombCfg = require(ReplicatedStorage:WaitForChild("Config", 5):WaitForChild("Bombs", 5))
+end)
+
+local BOMB_NAMES = {}
+do
+	local assets = ReplicatedStorage:WaitForChild("Assets", 5)
+	local folder = assets and assets:WaitForChild("Bombs", 5)
+	if folder then
+		local special = {} -- event bombs that can't be rolled (e.g. TurkeyBomb)
+		if BombCfg and type(BombCfg.Special) == "table" then
+			for _, b in ipairs(BombCfg.Special) do special[b.Id] = true end
+		end
+		for _, child in ipairs(folder:GetChildren()) do
+			if not special[child.Name] then
+				table.insert(BOMB_NAMES, child.Name)
+			end
+		end
+		local function rankOf(name)
+			local b = BombCfg and BombCfg.ById and BombCfg.ById[name]
+			if b and BombCfg.Rank then return b.Tier * 1000 + BombCfg.Rank(name) end
+			return math.huge
+		end
+		table.sort(BOMB_NAMES, function(a, b)
+			local ra, rb = rankOf(a), rankOf(b)
+			if ra ~= rb then return ra < rb end
+			return a < b
+		end)
+	end
+	if #BOMB_NAMES == 0 then
+		BOMB_NAMES = table.clone(ITEM_NAMES) -- couldn't read the folder: built-in list
+	end
+end
+
 local ROLL_DELAY = 1.5
 local BUY_WINDOW = 0.5
 local COLLECT_INTERVAL = 30 -- seconds between cash collections
@@ -98,6 +135,10 @@ local autoThrow = false
 local autoCollect = false
 local autoSpin = false
 local autoStay = true -- claim the stay reward whenever it's available (on by default)
+local autoEquipBest = true -- equip best fish after each throw
+local webhookUrl = ""
+local webhookAlerts = true
+local webhookReports = true
 local autoFarm = false
 local farmPhase = "roll" -- "roll" (roll + collect) or "throw" (walk to lookout + throw)
 local statusSetter = nil -- set after the UI is built
@@ -117,7 +158,7 @@ local function loadSettings()
 	if ok and type(data) == "table" then
 		if type(data.items) == "table" then
 			for _, name in ipairs(data.items) do
-				if table.find(ITEM_NAMES, name) then
+				if table.find(BOMB_NAMES, name) then
 					selected[name] = true
 				end
 			end
@@ -127,6 +168,10 @@ local function loadSettings()
 		autoSpin = data.autoSpin == true
 		autoFarm = data.autoFarm == true
 		autoStay = data.autoStay ~= false
+		autoEquipBest = data.autoEquipBest ~= false
+		if type(data.webhookUrl) == "string" then webhookUrl = data.webhookUrl end
+		webhookAlerts = data.webhookAlerts ~= false
+		webhookReports = data.webhookReports ~= false
 	end
 end
 
@@ -142,6 +187,10 @@ local function saveSettings()
 			autoSpin = autoSpin,
 			autoFarm = autoFarm,
 			autoStay = autoStay,
+			autoEquipBest = autoEquipBest,
+			webhookUrl = webhookUrl,
+			webhookAlerts = webhookAlerts,
+			webhookReports = webhookReports,
 		}))
 	end)
 end
@@ -482,6 +531,34 @@ local function collectCash()
 		return Vector3.new(d.X, 0, d.Z).Magnitude
 	end
 
+	-- standing on the pad doesn't trigger it again, so step off first and walk back on
+	if flatDist() <= flatTol then
+		local half = math.max(part.Size.X, part.Size.Z) / 2
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		params.FilterDescendantsInstances = { char }
+
+		local offTarget = nil
+		for _, dir in ipairs({ Vector3.xAxis, -Vector3.xAxis, Vector3.zAxis, -Vector3.zAxis }) do
+			local target = part.Position + dir * (half + 6)
+			local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
+			local hit = Workspace:Raycast(root.Position, flat, params)
+			if not (hit and hit.Instance.CanCollide) then
+				offTarget = target
+				break
+			end
+		end
+		offTarget = offTarget or (part.Position + Vector3.xAxis * (half + 6))
+
+		local offStep = newMover()
+		local offDeadline = os.clock() + 8
+		while collecting and not throwActive() and os.clock() < offDeadline
+			and Vector3.new(root.Position.X - offTarget.X, 0, root.Position.Z - offTarget.Z).Magnitude > 2 do
+			offStep(humanoid, root, offTarget)
+			task.wait(0.1)
+		end
+	end
+
 	local step = newMover()
 	local deadline = os.clock() + 20
 	while collecting and not throwActive() and os.clock() < deadline and flatDist() > flatTol do
@@ -710,6 +787,31 @@ local function fishInventoryFull(buffer)
 	return n ~= nil and max ~= nil and n >= max - (buffer or 0)
 end
 
+-- Auto Equip Best Fish: after each throw, wait for its fish to land, then equip best
+local equipQueued = 0
+local equipWorker = false
+local function scheduleEquipBest()
+	if not autoEquipBest or not Remotes then return end
+	equipQueued += 1
+	if equipWorker then return end
+	equipWorker = true
+	task.spawn(function()
+		while alive and equipQueued > 0 do
+			equipQueued -= 1
+			local baseline = fishCount() or 0
+			local t0 = os.clock()
+			while alive and os.clock() - t0 < 10 do
+				local n = fishCount()
+				if n and n > baseline then break end
+				task.wait(0.25)
+			end
+			task.wait(0.8) -- the rest of this throw's fish
+			pcall(function() Remotes.get("Tank"):FireServer("EquipBest") end)
+		end
+		equipWorker = false
+	end)
+end
+
 -- The arrow runs 0 -> 1 -> 0 every 2 * Timing.Sweep seconds and Perfect is fill >= bestTier.Start
 -- (0.98), so the window is only a few ms either side of the peak. Waiting for the arrow to enter it
 -- fails on low FPS (a frame can skip the whole window), so this presses on the frame closest to the
@@ -799,7 +901,9 @@ local throwConn = RunService.RenderStepped:Connect(function(dt)
 		armed = false
 		prevFill = nil
 		lastThrow = os.clock()
+		session.thrown += 1
 		reportThrow(button.Parent)
+		scheduleEquipBest()
 	end
 end)
 table.insert(connections, throwConn)
@@ -807,11 +911,6 @@ table.insert(connections, throwConn)
 ---------------------------------------------------------------------
 -- BOMB HELPERS (ranking, stack counts) + AUTO EQUIP HIGHEST BOMB
 ---------------------------------------------------------------------
-local BombCfg
-pcall(function()
-	BombCfg = require(ReplicatedStorage:WaitForChild("Config", 5):WaitForChild("Bombs", 5))
-end)
-
 local MAX_HELD = (BombCfg and tonumber(BombCfg.MaxHeld)) or 50
 
 local function normName(s)
@@ -1168,6 +1267,7 @@ local function sendSells(ids)
 		sold += 1
 		task.wait(0.15)
 	end
+	session.sold += sold
 	return sold
 end
 
@@ -1274,6 +1374,16 @@ task.spawn(function()
 	end
 end)
 
+-- Auto Farm: keep the sell shop UI closed (selling still works in the background)
+track(RunService.Heartbeat:Connect(function()
+	if not autoFarm then return end
+	local frames = playerGui:FindFirstChild("Frames")
+	local sell = frames and frames:FindFirstChild("Sell")
+	if sell and sell:IsA("GuiObject") and sell.Visible then
+		sell.Visible = false
+	end
+end))
+
 local function enterThrowPhase()
 	lock() -- waits for any roll/collect step to finish
 	if autoFarm and farmPhase == "roll" then
@@ -1329,6 +1439,335 @@ task.spawn(function()
 				end
 			end
 		end
+	end
+end)
+
+---------------------------------------------------------------------
+-- WEBHOOK (new fish for your tank + team report), Discord embeds
+---------------------------------------------------------------------
+local FormatCfg, MutationsCfg, RebirthCfg, MarketCfg
+do
+	local cfg = ReplicatedStorage:FindFirstChild("Config")
+	local util = ReplicatedStorage:FindFirstChild("Util")
+	if util then
+		pcall(function() FormatCfg = require(util:WaitForChild("Format", 5)) end)
+	end
+	if cfg then
+		pcall(function() MutationsCfg = require(cfg:WaitForChild("Mutations", 5)) end)
+		pcall(function() RebirthCfg = require(cfg:WaitForChild("Rebirth", 5)) end)
+		pcall(function() MarketCfg = require(cfg:WaitForChild("Market", 5)) end)
+	end
+end
+
+-- whichever HTTP function the executor provides
+local httpRequest = request or http_request or (syn and syn.request) or (fluxus and fluxus.request)
+
+local gameNameCache = nil -- filled in by the UI section
+
+local function webhookTarget()
+	local url = webhookUrl
+	if url == "" and isfile and readfile then
+		-- fallback: put the URL in VintHubWebhook.txt in your executor's workspace folder
+		pcall(function()
+			if isfile("VintHubWebhook.txt") then
+				url = readfile("VintHubWebhook.txt"):gsub("%s", "")
+			end
+		end)
+	end
+	if url:match("^https://") then return url end
+	return ""
+end
+
+local function abbreviate(n)
+	if FormatCfg and FormatCfg.abbreviate then
+		local ok, text = pcall(FormatCfg.abbreviate, n)
+		if ok and type(text) == "string" then return text end
+	end
+	for _, u in ipairs({ { 1e12, "T" }, { 1e9, "B" }, { 1e6, "M" }, { 1e3, "K" } }) do
+		if n >= u[1] then return ("%.2f%s"):format(n / u[1], u[2]) end
+	end
+	return tostring(math.floor(n + 0.5))
+end
+
+local function money(n)
+	return "$" .. abbreviate(n)
+end
+
+local function weightText(w)
+	if FormatCfg and FormatCfg.kg then
+		local ok, text = pcall(FormatCfg.kg, w)
+		if ok and type(text) == "string" then return text end
+	end
+	return ("%.2f kg"):format(tonumber(w) or 0)
+end
+
+-- same multiplier the game shows next to each fish's $/s
+local function moneyFactor()
+	local factor = 1
+	pcall(function()
+		local reb = (RebirthCfg and DataCtl) and RebirthCfg.Multiplier(DataCtl.Get("Rebirths") or 0) or 1
+		local market = MarketCfg and MarketCfg.MoneyFactor(player) or 1
+		factor = reb * market
+	end)
+	return factor
+end
+
+local function describeFish(f, tankFish, factor)
+	local def = FishCfg and FishCfg.ById[f.Species]
+	local mut = MutationsCfg and f.Mutation and MutationsCfg.ByKey[f.Mutation]
+	local ok, raw = pcall(TankCfg.Income, f.Species, f.Weight, f.Mutation, tankFish)
+	raw = (ok and type(raw) == "number") and raw or 0
+	return {
+		name = def and def.Name or tostring(f.Species),
+		rarity = def and def.Rarity or "?",
+		mutation = mut and mut.Name or "None",
+		weight = weightText(f.Weight),
+		raw = raw,
+		income = raw * factor,
+		image = def and def.Image,
+	}
+end
+
+local RARITY_COLORS = {
+	Common = 0x9ca3af, Uncommon = 0x22c55e, Rare = 0x3b82f6, Epic = 0xa855f7,
+	Legendary = 0xf59e0b, Mythic = 0xef4444, Exclusive = 0xec4899,
+}
+
+local thumbCache = {}
+local function thumbnailUrl(assetId)
+	if not assetId or assetId == "" or not httpRequest then return nil end
+	if thumbCache[assetId] ~= nil then return thumbCache[assetId] or nil end
+	local url = nil
+	pcall(function()
+		local res = httpRequest({
+			Url = ("https://thumbnails.roblox.com/v1/assets?assetIds=%s&returnPolicy=PlaceHolder&size=150x150&format=Png&isCircular=false"):format(assetId),
+			Method = "GET",
+		})
+		if res and res.Body then
+			local data = HttpService:JSONDecode(res.Body)
+			local item = data and data.data and data.data[1]
+			if item and item.imageUrl and item.imageUrl ~= "" then
+				url = item.imageUrl
+			end
+		end
+	end)
+	thumbCache[assetId] = url or false
+	return url
+end
+
+local function footerText()
+	return "VintHub | " .. (gameNameCache or game.Name) .. " • " .. player.Name
+end
+
+local function postWebhook(payload)
+	local url = webhookTarget()
+	if url == "" then return false, "no webhook URL" end
+	if not httpRequest then return false, "executor has no HTTP function" end
+	local ok, res = pcall(httpRequest, {
+		Url = url,
+		Method = "POST",
+		Headers = { ["Content-Type"] = "application/json" },
+		Body = HttpService:JSONEncode(payload),
+	})
+	if not ok then return false, tostring(res) end
+	local code = res and (res.StatusCode or res.Status)
+	return type(code) == "number" and code >= 200 and code < 300, code
+end
+
+-- one message every ~1.2s so Discord's rate limit is never hit
+local webhookQueue = {}
+local function enqueueWebhook(payload)
+	if #webhookQueue < 25 then table.insert(webhookQueue, payload) end
+end
+
+task.spawn(function()
+	while alive do
+		task.wait(1.2)
+		local payload = table.remove(webhookQueue, 1)
+		if payload then
+			local ok, code = postWebhook(payload)
+			if code == 429 then
+				table.insert(webhookQueue, 1, payload)
+				task.wait(3)
+			elseif not ok then
+				warn("[VintHub] webhook failed: " .. tostring(code))
+				setStatus("Webhook failed (" .. tostring(code) .. ")")
+			end
+		end
+	end
+end)
+
+-- tank + inventory snapshot used by alerts and reports
+local function readTank()
+	if not (DataCtl and FishCfg and TankCfg and TankCfg.Income) then return nil end
+	local okI, inv = pcall(DataCtl.Get, "Inventory")
+	local okT, tank = pcall(DataCtl.Get, "Tank")
+	if not (okI and okT and type(inv) == "table" and type(tank) == "table" and type(inv.Fish) == "table") then
+		return nil
+	end
+	local tankFish = type(tank.Fish) == "table" and tank.Fish or {}
+	local cap = tonumber(tank.Capacity) or #tankFish
+	local factor = moneyFactor()
+
+	local infos = {}
+	for _, f in ipairs(tankFish) do
+		table.insert(infos, describeFish(f, tankFish, factor))
+	end
+	table.sort(infos, function(a, b) return a.income > b.income end)
+
+	return {
+		inv = inv, tankFish = tankFish, cap = cap, factor = factor, infos = infos,
+		free = math.max(cap - #tankFish, 0),
+		best = infos[1], weakest = infos[#infos],
+	}
+end
+
+-- Message A: a new fish that fits in your tank
+local function alertPayload(info, snap, isBest)
+	local versus
+	if snap.free > 0 then
+		versus = "free slot"
+	else
+		versus = "+" .. money(math.max(info.income - snap.weakest.income, 0)) .. "/s vs weakest"
+	end
+	local fields = {
+		{ name = "Fish", value = info.name, inline = true },
+		{ name = "Rarity", value = info.rarity, inline = true },
+		{ name = "Mutation", value = info.mutation, inline = true },
+		{ name = "Weight", value = info.weight, inline = true },
+		{ name = "Income", value = money(info.income) .. "/s (" .. versus .. ")", inline = true },
+		{ name = "Tank", value = ("%d/%d slots"):format(#snap.tankFish, snap.cap), inline = true },
+	}
+	if snap.free == 0 and snap.weakest then
+		table.insert(fields, {
+			name = "Would replace",
+			value = ("%s (%s/s)"):format(snap.weakest.name, money(snap.weakest.income)),
+			inline = false,
+		})
+	end
+	local thumb = thumbnailUrl(info.image)
+	return {
+		username = "VintHub",
+		embeds = {{
+			title = isBest and "🏆 New best fish!" or "🐟 New fish for your tank!",
+			color = RARITY_COLORS[info.rarity] or 0x3b82f6,
+			fields = fields,
+			thumbnail = thumb and { url = thumb } or nil,
+			footer = { text = footerText() },
+			timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+		}},
+	}
+end
+
+-- Message B: tank report (your "team")
+local function reportPayload(snap)
+	local total = 0
+	for _, info in ipairs(snap.infos) do total += info.income end
+
+	local top = {}
+	for i = 1, math.min(5, #snap.infos) do
+		local f = snap.infos[i]
+		local mut = f.mutation ~= "None" and (" · " .. f.mutation) or ""
+		top[i] = ("%d. %s · %s%s · %s · %s/s"):format(i, f.name, f.rarity, mut, f.weight, money(f.income))
+	end
+
+	local secs = math.floor(os.clock() - session.start)
+	local uptime = ("%dh %dm"):format(math.floor(secs / 3600), math.floor(secs % 3600 / 60))
+	local sessionText = ("%d found · %d sold · %d thrown · perfect %d/%d · %s"):format(
+		session.found, session.sold, session.thrown, throwHits, throwHits + throwMisses, uptime)
+
+	local fields = {
+		{ name = "Total income", value = money(total) .. "/s", inline = true },
+		{ name = "Fish", value = ("%d/%d"):format(#snap.tankFish, snap.cap), inline = true },
+		{ name = "Top fish", value = #top > 0 and table.concat(top, "\n") or "-", inline = false },
+		{
+			name = "Weakest",
+			value = snap.weakest and ("%s · %s/s"):format(snap.weakest.name, money(snap.weakest.income)) or "-",
+			inline = false,
+		},
+		{ name = "Session", value = sessionText, inline = false },
+	}
+	return {
+		username = "VintHub",
+		embeds = {{
+			title = "📊 Tank report",
+			color = 0x2563eb,
+			fields = fields,
+			footer = { text = footerText() },
+			timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+		}},
+	}
+end
+
+local function sendReportNow()
+	local snap = readTank()
+	if not snap then return false, "tank data not ready" end
+	return postWebhook(reportPayload(snap))
+end
+
+local function sendTestMessage()
+	return postWebhook({
+		username = "VintHub",
+		embeds = {{
+			title = "✅ VintHub webhook connected",
+			description = "Alerts for new tank fish and tank reports will show up here.",
+			color = 0x22c55e,
+			footer = { text = footerText() },
+			timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+		}},
+	})
+end
+
+-- watches the inventory and tank once a second
+local seenFish = {}
+local bestRawSeen = 0
+local webhookReady = false
+
+local function webhookTick()
+	local snap = readTank()
+	if not snap then return end
+
+	local fresh = {}
+	for _, f in ipairs(snap.inv.Fish) do
+		if not seenFish[f.Id] then
+			seenFish[f.Id] = true
+			if webhookReady then
+				session.found += 1
+				table.insert(fresh, f)
+			end
+		end
+	end
+
+	local canSend = webhookReady and webhookTarget() ~= "" and httpRequest ~= nil
+
+	-- any new fish that fills a slot, replaces one, or beats the weakest tank fish
+	if canSend and webhookAlerts then
+		for _, f in ipairs(fresh) do
+			local info = describeFish(f, snap.tankFish, snap.factor)
+			local fits = snap.free > 0 or not snap.weakest or info.income > snap.weakest.income
+			if fits then
+				local isBest = snap.best ~= nil and info.raw > snap.best.raw
+				enqueueWebhook(alertPayload(info, snap, isBest))
+			end
+		end
+	end
+
+	-- a new best fish made it into the tank: send the report
+	if snap.best and snap.best.raw > bestRawSeen then
+		bestRawSeen = snap.best.raw
+		if canSend and webhookReports then
+			enqueueWebhook(reportPayload(snap))
+		end
+	end
+
+	webhookReady = true
+end
+
+task.spawn(function()
+	while alive do
+		task.wait(1)
+		local ok, err = pcall(webhookTick)
+		if not ok then warn("[VintHub] webhook tick error: " .. tostring(err)) end
 	end
 end)
 
@@ -1405,6 +1844,8 @@ pcall(function()
 	end
 end)
 
+gameNameCache = gameName
+
 -- blue gradient theme: tries gradients first, then a solid blue theme, then plain Dark
 local function registerTheme()
 	local function hex(h) return Color3.fromHex(h) end
@@ -1466,8 +1907,9 @@ pcall(function()
 end)
 
 local Tab = Window:Tab({ Title = "Main", Icon = "home" })
+local RewardsTab = Window:Tab({ Title = "Rewards", Icon = "gift" })
 
-local rollToggle, collectToggle, throwToggle, spinToggle, farmToggle
+local rollToggle, collectToggle, throwToggle, spinToggle, farmToggle, bombDropdown
 
 local function setLocked(element, locked)
 	pcall(function()
@@ -1499,33 +1941,56 @@ end
 
 local function selectedList()
 	local arr = {}
-	for _, n in ipairs(ITEM_NAMES) do
+	for _, n in ipairs(BOMB_NAMES) do
 		if selected[n] then table.insert(arr, n) end
 	end
 	return arr
 end
 
-Tab:Dropdown({
+-- "Select All" / "Clear All" are entries at the top of the dropdown itself
+local SELECT_ALL, CLEAR_ALL = "★ Select All", "✖ Clear All"
+local bombValues = { SELECT_ALL, CLEAR_ALL }
+for _, n in ipairs(BOMB_NAMES) do table.insert(bombValues, n) end
+local applyingBombs = false
+
+bombDropdown = Tab:Dropdown({
 	Title = "Bombs to buy",
-	Desc = "Buys any selected bomb that shows up in the offers",
-	Values = ITEM_NAMES,
+	Desc = "Buys any selected bomb that shows up in the offers. New bombs are added automatically.",
+	Values = bombValues,
 	Value = selectedList(),
 	Multi = true,
 	AllowNone = true,
 	Callback = function(chosen)
-		if building then return end
-		table.clear(selected)
+		if building or applyingBombs then return end
+
+		local picked = {}
 		if type(chosen) == "table" then
 			for k, v in pairs(chosen) do
 				if type(v) == "string" then
-					selected[v] = true
+					picked[v] = true
 				elseif v == true and type(k) == "string" then
-					selected[k] = true
+					picked[k] = true
 				end
 			end
 		elseif type(chosen) == "string" then
-			selected[chosen] = true
+			picked[chosen] = true
 		end
+
+		if picked[SELECT_ALL] or picked[CLEAR_ALL] then
+			table.clear(selected)
+			if picked[SELECT_ALL] then
+				for _, n in ipairs(BOMB_NAMES) do selected[n] = true end
+			end
+			saveSettings()
+			-- show the real selection again (the two action entries untick themselves)
+			applyingBombs = true
+			pcall(function() bombDropdown:Select(selectedList()) end)
+			applyingBombs = false
+			return
+		end
+
+		table.clear(selected)
+		for n in pairs(picked) do selected[n] = true end
 		saveSettings()
 	end,
 })
@@ -1607,7 +2072,7 @@ collectToggle = Tab:Toggle({
 	end,
 })
 
-spinToggle = Tab:Toggle({
+spinToggle = RewardsTab:Toggle({
 	Title = "Auto Spin Wheel",
 	Desc = "Spins the wheel and skips the animation (no walking)",
 	Value = autoSpin,
@@ -1625,6 +2090,17 @@ spinToggle = Tab:Toggle({
 })
 
 Tab:Toggle({
+	Title = "Auto Equip Best Fish",
+	Desc = "After each throw, equips the best fish into your tank",
+	Value = autoEquipBest,
+	Callback = function(state)
+		if building then return end
+		autoEquipBest = state
+		saveSettings()
+	end,
+})
+
+RewardsTab:Toggle({
 	Title = "Auto Claim Stay Reward",
 	Desc = "Claims the stay reward whenever it's available",
 	Value = autoStay,
@@ -1642,6 +2118,74 @@ local statusPara = Tab:Paragraph({
 
 statusSetter = function(text)
 	pcall(function() statusPara:SetDesc(text) end)
+end
+
+-- Webhook tab
+local okWeb, errWeb = pcall(function()
+	local WebTab = Window:Tab({ Title = "Webhook", Icon = "send" })
+
+	WebTab:Input({
+		Title = "Webhook URL",
+		Desc = "Discord webhook. Saved in plain text in your settings file.",
+		Value = webhookUrl,
+		Placeholder = "https://discord.com/api/webhooks/...",
+		Callback = function(text)
+			if building then return end
+			webhookUrl = tostring(text or ""):gsub("%s", "")
+			saveSettings()
+		end,
+	})
+
+	WebTab:Toggle({
+		Title = "New fish alerts",
+		Desc = "Fish that fill or replace a tank slot, or beat your weakest tank fish",
+		Value = webhookAlerts,
+		Callback = function(state)
+			if building then return end
+			webhookAlerts = state
+			saveSettings()
+		end,
+	})
+
+	WebTab:Toggle({
+		Title = "Tank report on new best fish",
+		Desc = "Sends your tank lineup and session stats when you get a new best fish",
+		Value = webhookReports,
+		Callback = function(state)
+			if building then return end
+			webhookReports = state
+			saveSettings()
+		end,
+	})
+
+	WebTab:Button({
+		Title = "Send test message",
+		Callback = function()
+			task.spawn(function()
+				local ok, code = sendTestMessage()
+				notify("Webhook", ok and "Test message sent" or ("Failed: " .. tostring(code)))
+			end)
+		end,
+	})
+
+	WebTab:Button({
+		Title = "Send tank report now",
+		Callback = function()
+			task.spawn(function()
+				local ok, code = sendReportNow()
+				notify("Webhook", ok and "Report sent" or ("Failed: " .. tostring(code)))
+			end)
+		end,
+	})
+
+	WebTab:Paragraph({
+		Title = "HTTP support",
+		Desc = httpRequest and "Your executor has an HTTP function (webhooks should work)"
+			or "No HTTP function found: webhooks won't send on this executor",
+	})
+end)
+if not okWeb then
+	warn("[VintHub] webhook tab failed: " .. tostring(errWeb))
 end
 
 applyModes()
