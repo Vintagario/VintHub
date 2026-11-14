@@ -119,6 +119,30 @@ do
 	end
 end
 
+-- Mutation keys from Config.Mutations, in the game's own order (lowest multiplier first).
+-- Offers store the key in their "Mutation" property (e.g. "Shiny"); no mutation = "".
+local MUT_NAMES = {}
+do
+	local ok, cfg = pcall(function()
+		return require(ReplicatedStorage:WaitForChild("Config", 5):WaitForChild("Mutations", 5))
+	end)
+	if ok and type(cfg) == "table" then
+		if type(cfg.List) == "table" then
+			for _, m in ipairs(cfg.List) do
+				if type(m.Key) == "string" and m.Key ~= "" then table.insert(MUT_NAMES, m.Key) end
+			end
+		elseif type(cfg.ByKey) == "table" then
+			for key in pairs(cfg.ByKey) do
+				if type(key) == "string" and key ~= "" then table.insert(MUT_NAMES, key) end
+			end
+			table.sort(MUT_NAMES)
+		end
+	end
+	if #MUT_NAMES == 0 then
+		MUT_NAMES = { "Shiny", "Molten", "Plasma", "Pixel", "Galaxy", "Glitched" } -- config unreadable: known list
+	end
+end
+
 local ROLL_DELAY = 1.5
 local BUY_WINDOW = 0.5
 local COLLECT_INTERVAL = 30 -- seconds between cash collections
@@ -131,6 +155,7 @@ local SAVE_FILE = "AutoRollSettings.json"
 -- SAVE / LOAD (needs writefile/readfile from your executor)
 ---------------------------------------------------------------------
 local selected = {}   -- [name] = true
+local selectedMut = {} -- mutation filter, [key] = true (empty = no filter)
 local autoThrow = false
 local autoCollect = false
 local autoSpin = false
@@ -163,6 +188,13 @@ local function loadSettings()
 				end
 			end
 		end
+		if type(data.mutations) == "table" then
+			for _, name in ipairs(data.mutations) do
+				if table.find(MUT_NAMES, name) then
+					selectedMut[name] = true
+				end
+			end
+		end
 		autoThrow = data.autoThrow == true
 		autoCollect = data.autoCollect == true
 		autoSpin = data.autoSpin == true
@@ -179,9 +211,12 @@ local function saveSettings()
 	if not writefile then return end
 	local items = {}
 	for name in pairs(selected) do table.insert(items, name) end
+	local muts = {}
+	for name in pairs(selectedMut) do table.insert(muts, name) end
 	pcall(function()
 		writefile(SAVE_FILE, HttpService:JSONEncode({
 			items = items,
+			mutations = muts,
 			autoThrow = autoThrow,
 			autoCollect = autoCollect,
 			autoSpin = autoSpin,
@@ -457,10 +492,37 @@ local function roll()
 end
 
 -- Returns: "bought", "expensive", or nil
+local function offerMutation(offer)
+	local m = offer:GetAttribute("Mutation")
+	if type(m) == "string" and m ~= "" then return m end
+	local child = offer:FindFirstChild("Mutation")
+	if child and child:IsA("ValueBase") and tostring(child.Value) ~= "" then
+		return tostring(child.Value)
+	end
+	return nil
+end
+
+-- no mutations selected = buy any selected bomb; otherwise it must carry one of the selected mutations
+local function mutationAllowed(offer)
+	if next(selectedMut) == nil then return true end
+	local m = offerMutation(offer)
+	return m ~= nil and selectedMut[m] == true
+end
+
+local lastSkipNote = ""
+
 local function tryBuy()
 	local sawExpensive = false
 	for name in pairs(selected) do
 		local offer = offers:FindFirstChild(name)
+		if offer and not mutationAllowed(offer) then
+			local note = name .. " (" .. tostring(offerMutation(offer) or "no mutation") .. ")"
+			if note ~= lastSkipNote then
+				lastSkipNote = note
+				print("[VintHub] skipped " .. note .. ": mutation filter")
+			end
+			offer = nil
+		end
 		if offer then
 			local cost = getCost(offer)
 			local cash = getCash()
@@ -2020,6 +2082,60 @@ bombDropdown = Tab:Dropdown({
 
 		table.clear(selected)
 		for n in pairs(picked) do selected[n] = true end
+		saveSettings()
+	end,
+})
+
+local function selectedMutList()
+	local arr = {}
+	for _, n in ipairs(MUT_NAMES) do
+		if selectedMut[n] then table.insert(arr, n) end
+	end
+	return arr
+end
+
+local mutValues = { SELECT_ALL, CLEAR_ALL }
+for _, n in ipairs(MUT_NAMES) do table.insert(mutValues, n) end
+local applyingMuts = false
+local mutDropdown
+
+mutDropdown = Tab:Dropdown({
+	Title = "Mutation filter",
+	Desc = "Leave empty to buy any selected bomb. If you pick any, it only buys selected bombs that have one of these mutations.",
+	Values = mutValues,
+	Value = selectedMutList(),
+	Multi = true,
+	AllowNone = true,
+	Callback = function(chosen)
+		if building or applyingMuts then return end
+
+		local picked = {}
+		if type(chosen) == "table" then
+			for k, v in pairs(chosen) do
+				if type(v) == "string" then
+					picked[v] = true
+				elseif v == true and type(k) == "string" then
+					picked[k] = true
+				end
+			end
+		elseif type(chosen) == "string" then
+			picked[chosen] = true
+		end
+
+		if picked[SELECT_ALL] or picked[CLEAR_ALL] then
+			table.clear(selectedMut)
+			if picked[SELECT_ALL] then
+				for _, n in ipairs(MUT_NAMES) do selectedMut[n] = true end
+			end
+			saveSettings()
+			applyingMuts = true
+			pcall(function() mutDropdown:Select(selectedMutList()) end)
+			applyingMuts = false
+			return
+		end
+
+		table.clear(selectedMut)
+		for n in pairs(picked) do selectedMut[n] = true end
 		saveSettings()
 	end,
 })
