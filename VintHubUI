@@ -1,0 +1,355 @@
+-- VintHub UI TEMPLATE (WindUI)
+-- Layout: window "VintHub | <game>", blue gradient theme, tabs: Main / Rewards / Webhook.
+-- Replace the "-- TODO" callbacks with your own logic. Everything else (single-instance
+-- guard, saved settings, theme fallbacks, locking, notifications, status line) already works.
+
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local MarketplaceService = game:GetService("MarketplaceService")
+local player = Players.LocalPlayer
+
+---------------------------------------------------------------------
+-- SINGLE INSTANCE (re-executing closes the previous copy, then reloads)
+---------------------------------------------------------------------
+local env = (getgenv and getgenv()) or _G
+if type(env.VintHubCleanup) == "function" then
+	pcall(env.VintHubCleanup)
+	task.wait(0.5)
+end
+
+local alive = true
+local connections, extras = {}, {}
+local function track(conn)
+	table.insert(connections, conn)
+	return conn
+end
+
+env.VintHubCleanup = function()
+	alive = false
+	for _, c in ipairs(connections) do
+		pcall(function() c:Disconnect() end)
+	end
+	for _, f in ipairs(extras) do
+		pcall(f)
+	end
+end
+-- loops you add later should be written as:  while alive do ... end
+
+---------------------------------------------------------------------
+-- SETTINGS (saved to a file; needs readfile/writefile from your executor)
+---------------------------------------------------------------------
+local SAVE_FILE = "VintHubTemplate.json"
+
+local state = {
+	items = {},          -- multi-select dropdown, [name] = true
+	autoMain = false,    -- example toggle on Main
+	autoReward = true,   -- example toggle on Rewards
+	webhookUrl = "",
+	webhookAlerts = true,
+}
+
+local ITEM_NAMES = { "ItemA", "ItemB", "ItemC" } -- TODO: build this from the game (e.g. a folder's children)
+
+local function loadSettings()
+	if not (isfile and readfile) then return end
+	local ok, data = pcall(function()
+		if isfile(SAVE_FILE) then
+			return HttpService:JSONDecode(readfile(SAVE_FILE))
+		end
+	end)
+	if ok and type(data) == "table" then
+		if type(data.items) == "table" then
+			for _, name in ipairs(data.items) do
+				if table.find(ITEM_NAMES, name) then state.items[name] = true end
+			end
+		end
+		state.autoMain = data.autoMain == true
+		state.autoReward = data.autoReward ~= false -- on by default
+		if type(data.webhookUrl) == "string" then state.webhookUrl = data.webhookUrl end
+		state.webhookAlerts = data.webhookAlerts ~= false
+	end
+end
+
+local function saveSettings()
+	if not writefile then return end
+	local items = {}
+	for name in pairs(state.items) do table.insert(items, name) end
+	pcall(function()
+		writefile(SAVE_FILE, HttpService:JSONEncode({
+			items = items,
+			autoMain = state.autoMain,
+			autoReward = state.autoReward,
+			webhookUrl = state.webhookUrl,
+			webhookAlerts = state.webhookAlerts,
+		}))
+	end)
+end
+
+loadSettings()
+
+local statusSetter = nil
+local function setStatus(text)
+	if statusSetter then statusSetter(text) end
+end
+
+---------------------------------------------------------------------
+-- YOUR FEATURE LOOPS GO HERE (use state.autoMain etc. and `while alive do`)
+---------------------------------------------------------------------
+-- task.spawn(function()
+-- 	while alive do
+-- 		if state.autoMain then
+-- 			-- TODO
+-- 		end
+-- 		task.wait(0.5)
+-- 	end
+-- end)
+
+---------------------------------------------------------------------
+-- UI (WindUI)
+---------------------------------------------------------------------
+-- To pin a reviewed version, swap "main" in this URL for a commit hash.
+local WINDUI_URL = "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
+
+local okLoad, WindUI = pcall(function()
+	return loadstring(game:HttpGet(WINDUI_URL))()
+end)
+if not okLoad or type(WindUI) ~= "table" then
+	warn("[VintHub] couldn't load WindUI: " .. tostring(WindUI))
+	return
+end
+
+-- window title: "VintHub | <game name>"
+local gameName = game.Name
+pcall(function()
+	local info = MarketplaceService:GetProductInfo(game.PlaceId)
+	if info and info.Name and info.Name ~= "" then gameName = info.Name end
+end)
+
+-- blue gradient theme: tries gradients, then a solid blue theme, then plain Dark
+local function registerTheme()
+	local function hex(h) return Color3.fromHex(h) end
+	local base = {
+		Name = "VintBlue",
+		Accent = hex("#2563eb"),
+		Dialog = hex("#0b1530"),
+		Outline = hex("#3b82f6"),
+		Text = hex("#e8f1ff"),
+		Placeholder = hex("#7f93b8"),
+		Background = hex("#0a1228"),
+		Button = hex("#1e3a8a"),
+		Icon = hex("#93c5fd"),
+	}
+
+	local okGradient = pcall(function()
+		local theme = table.clone(base)
+		theme.Accent = WindUI:Gradient({
+			["0"] = { Color = hex("#1d4ed8"), Transparency = 0 },
+			["100"] = { Color = hex("#38bdf8"), Transparency = 0 },
+		}, { Rotation = 45 })
+		theme.Background = WindUI:Gradient({
+			["0"] = { Color = hex("#050b1f"), Transparency = 0 },
+			["100"] = { Color = hex("#0f2a5c"), Transparency = 0 },
+		}, { Rotation = 45 })
+		WindUI:AddTheme(theme)
+	end)
+	if okGradient then return "VintBlue" end
+
+	local okSolid = pcall(function() WindUI:AddTheme(base) end)
+	return okSolid and "VintBlue" or "Dark"
+end
+
+local themeName = registerTheme()
+
+-- callbacks are ignored while the UI is being built, so a startup callback
+-- can't wipe the settings that were loaded from disk
+local building = true
+
+local Window = WindUI:CreateWindow({
+	Title = "VintHub | " .. gameName,
+	Icon = "star",
+	Theme = themeName,
+	Folder = "VintHub",
+	ToggleKey = Enum.KeyCode.RightShift, -- press to hide/show the window
+})
+
+pcall(function() WindUI:SetTheme(themeName) end)
+table.insert(extras, function() Window:Destroy() end) -- closes the old window on re-execute
+
+-- floating button shown while the window is minimized (also on PC)
+pcall(function()
+	Window:EditOpenButton({
+		Title = "VintHub",
+		Icon = "star",
+		Enabled = true,
+		OnlyMobile = false,
+		Draggable = true,
+	})
+end)
+
+-- tab order = creation order
+local Tab = Window:Tab({ Title = "Main", Icon = "home" })
+local RewardsTab = Window:Tab({ Title = "Rewards", Icon = "gift" })
+
+-- helpers --------------------------------------------------------------
+local function notify(title, content)
+	pcall(function()
+		WindUI:Notify({ Title = title, Content = content, Duration = 4 })
+	end)
+end
+
+-- greys out a control while another feature owns it (its on/off choice is kept)
+local function setLocked(element, locked)
+	pcall(function()
+		if not element then return end
+		if locked and element.Lock then
+			element:Lock()
+		elseif not locked and element.Unlock then
+			element:Unlock()
+		end
+	end)
+end
+
+local function selectedList()
+	local arr = {}
+	for _, n in ipairs(ITEM_NAMES) do
+		if state.items[n] then table.insert(arr, n) end
+	end
+	return arr
+end
+
+-- MAIN TAB -------------------------------------------------------------
+-- Multi-select dropdown with "Select All" / "Clear All" as the first two entries
+local SELECT_ALL, CLEAR_ALL = "★ Select All", "✖ Clear All"
+local dropdownValues = { SELECT_ALL, CLEAR_ALL }
+for _, n in ipairs(ITEM_NAMES) do table.insert(dropdownValues, n) end
+local applyingItems = false
+local itemDropdown
+
+itemDropdown = Tab:Dropdown({
+	Title = "Items",
+	Desc = "Pick one or more",
+	Values = dropdownValues,
+	Value = selectedList(),
+	Multi = true,
+	AllowNone = true,
+	Callback = function(chosen)
+		if building or applyingItems then return end
+
+		local picked = {}
+		if type(chosen) == "table" then
+			for k, v in pairs(chosen) do
+				if type(v) == "string" then
+					picked[v] = true
+				elseif v == true and type(k) == "string" then
+					picked[k] = true
+				end
+			end
+		elseif type(chosen) == "string" then
+			picked[chosen] = true
+		end
+
+		if picked[SELECT_ALL] or picked[CLEAR_ALL] then
+			table.clear(state.items)
+			if picked[SELECT_ALL] then
+				for _, n in ipairs(ITEM_NAMES) do state.items[n] = true end
+			end
+			saveSettings()
+			applyingItems = true
+			pcall(function() itemDropdown:Select(selectedList()) end)
+			applyingItems = false
+			return
+		end
+
+		table.clear(state.items)
+		for n in pairs(picked) do state.items[n] = true end
+		saveSettings()
+	end,
+})
+
+local mainToggle
+mainToggle = Tab:Toggle({
+	Title = "Auto Something",
+	Desc = "Describe what it does",
+	Value = state.autoMain,
+	Callback = function(on)
+		if building then return end
+		state.autoMain = on
+		saveSettings()
+		setStatus(on and "Auto Something on" or "Auto Something off")
+		-- TODO: your logic (or let the loop above read state.autoMain)
+	end,
+})
+
+Tab:Button({
+	Title = "Do a thing",
+	Callback = function()
+		-- TODO
+		notify("VintHub", "Done")
+	end,
+})
+
+local statusPara = Tab:Paragraph({
+	Title = "Status",
+	Desc = "Idle",
+})
+
+statusSetter = function(text)
+	pcall(function() statusPara:SetDesc(text) end)
+end
+
+-- REWARDS TAB ----------------------------------------------------------
+RewardsTab:Toggle({
+	Title = "Auto Claim Reward",
+	Desc = "Claims it whenever it's available",
+	Value = state.autoReward,
+	Callback = function(on)
+		if building then return end
+		state.autoReward = on
+		saveSettings()
+	end,
+})
+
+-- WEBHOOK TAB (wrapped so a missing element type can't break the rest) ---
+local okWeb, errWeb = pcall(function()
+	local WebTab = Window:Tab({ Title = "Webhook", Icon = "send" })
+
+	WebTab:Input({
+		Title = "Webhook URL",
+		Desc = "Saved in plain text in your settings file.",
+		Value = state.webhookUrl,
+		Placeholder = "https://discord.com/api/webhooks/...",
+		Callback = function(text)
+			if building then return end
+			state.webhookUrl = tostring(text or ""):gsub("%s", "")
+			saveSettings()
+		end,
+	})
+
+	WebTab:Toggle({
+		Title = "Alerts",
+		Value = state.webhookAlerts,
+		Callback = function(on)
+			if building then return end
+			state.webhookAlerts = on
+			saveSettings()
+		end,
+	})
+
+	WebTab:Button({
+		Title = "Send test message",
+		Callback = function()
+			-- TODO: POST to state.webhookUrl with request / http_request
+			notify("Webhook", "TODO: send a test message")
+		end,
+	})
+end)
+if not okWeb then
+	warn("[VintHub] webhook tab failed: " .. tostring(errWeb))
+end
+
+-- open on the Main tab
+pcall(function() Tab:Select() end)
+pcall(function() Window:SelectTab(1) end)
+
+building = false
+notify("VintHub", "Loaded")
