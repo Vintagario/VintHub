@@ -435,6 +435,8 @@ end
 
 -- After a purchase the game auto-equips the bomb; unequip it right away.
 local lastBuy = 0
+local lastRollAt = 0   -- when the lever was last pulled (a rolled bomb may still be waiting to be bought)
+local lastBuyNote = ""
 
 local function hookCharacter(char)
 	char.ChildAdded:Connect(function(child)
@@ -464,6 +466,8 @@ local function tryBuy()
 			local cash = getCash()
 			if cost and cash and cost > cash then
 				sawExpensive = true
+				lastBuyNote = ("%s: cost %.3g > cash %.3g"):format(name, cost, cash)
+				print("[VintHub] can't afford " .. lastBuyNote)
 			elseif interact(offer) then
 				lastBuy = os.clock()
 				local char = player.Character
@@ -472,10 +476,30 @@ local function tryBuy()
 					if hum then hum:UnequipTools() end
 				end)
 				return "bought", name
+			else
+				print("[VintHub] " .. name .. " is on offer but couldn't reach/trigger it")
 			end
 		end
 	end
 	return sawExpensive and "expensive" or nil
+end
+
+-- A bomb rolled just before we leave (to collect cash or to go throw) must be bought first,
+-- otherwise the offer can be gone by the time we come back. Waits out the lever animation if needed.
+local function flushPendingBuy()
+	if next(selected) == nil then return end
+	local window = 4
+	pcall(function()
+		if BombCfg and BombCfg.SpinLength then
+			window = math.min(BombCfg.SpinLength() + 0.5, 5)
+		end
+	end)
+	local deadline = lastRollAt + window
+	repeat
+		if tryBuy() == "bought" then return end
+		if os.clock() >= deadline then break end
+		task.wait(0.2)
+	until not alive or not running or os.clock() >= deadline
 end
 
 ---------------------------------------------------------------------
@@ -600,6 +624,7 @@ task.spawn(function()
 			lock()
 			-- state may have changed while we waited for the lock
 			if (autoCollect or autoFarm) and not throwActive() then
+				if running then pcall(flushPendingBuy) end
 				collecting = true
 				pcall(collectCash)
 				collecting = false
@@ -1386,6 +1411,9 @@ end))
 
 local function enterThrowPhase()
 	lock() -- waits for any roll/collect step to finish
+	if autoFarm and farmPhase == "roll" and running then
+		pcall(flushPendingBuy)
+	end
 	if autoFarm and farmPhase == "roll" then
 		farmPhase = "throw"
 		farmSpot = nil
@@ -1782,7 +1810,7 @@ local function rollIteration()
 	end
 
 	if result == "expensive" then
-		setStatus("Too expensive, rerolling")
+		setStatus("Too expensive, rerolling (" .. lastBuyNote .. ")")
 	end
 
 	if not roll() then
@@ -1791,12 +1819,13 @@ local function rollIteration()
 		return
 	end
 
+	lastRollAt = os.clock()
 	task.wait(BUY_WINDOW)
 	result, name = tryBuy()
 	if result == "bought" then
 		setStatus("Bought " .. name)
 	elseif result == "expensive" then
-		setStatus("Too expensive, skipped")
+		setStatus("Too expensive, skipped (" .. lastBuyNote .. ")")
 	else
 		setStatus("Rolling...")
 	end
